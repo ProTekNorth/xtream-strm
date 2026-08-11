@@ -1,0 +1,20 @@
+{
+  "server_url": "https://provider.example.com:443",
+  "username": "your-username",
+  "password": "your-password",
+  "output_dir": "/srv/media/xtream",
+  "sync_movies": true,
+  "sync_series": true,
+  "movies_directory": "Movies",
+  "series_directory": "TV Shows",
+  "category_directories": true,
+  "include_categories": [],
+  "exclude_categories": ["Adult"],
+  "clean_stale": true,
+  "allow_empty_library": false,
+  "request_timeout": 30,
+  "retries": 3,
+  "verify_tls": true,
+  "file_mode": "0640",
+  "directory_mode": "0750"
+}

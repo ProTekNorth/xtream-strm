@@ -1,0 +1,15 @@
+[Unit]
+Description=Export Xtream VOD library as STRM files
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=xtream-strm
+Group=media
+ExecStart=/opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0007

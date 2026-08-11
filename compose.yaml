@@ -1,0 +1,11 @@
+services:
+  xtream-strm:
+    build: .
+    restart: "no"
+    environment:
+      XTREAM_URL: ${XTREAM_URL}
+      XTREAM_USERNAME: ${XTREAM_USERNAME}
+      XTREAM_PASSWORD: ${XTREAM_PASSWORD}
+      XTREAM_OUTPUT: /library
+    volumes:
+      - ${MEDIA_PATH:-./library}:/library

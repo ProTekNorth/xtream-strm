@@ -1,0 +1,6 @@
+config.json
+.env
+library/
+__pycache__/
+*.py[cod]
+.DS_Store
