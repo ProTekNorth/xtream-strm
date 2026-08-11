@@ -114,6 +114,8 @@ Command-line connection settings override environment variables, which override 
 
 - `include_categories`: exact, case-insensitive category names to include; empty means all.
 - `exclude_categories`: exact, case-insensitive names to skip.
+- `normalize_names`: produce consistent media-server names by cleaning Unicode, HTML entities, whitespace, quality tags, release years, episode numbers, and season numbers.
+- `strip_name_prefixes`: case-insensitive provider prefixes to remove from movie and show names, such as `US:`, `UK:`, or `|EN|`.
 - `category_directories`: place titles beneath their provider category.
 - `clean_stale`: remove missing files created by earlier successful syncs.
 - `allow_empty_library`: permit an empty provider response to clear a selected library. It is disabled by default to protect against temporary provider problems and category-filter mistakes.
