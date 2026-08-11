@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import html
 import json
 import logging
 import os
@@ -27,6 +28,12 @@ LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
+QUALITY_TOKEN = r"(?:4k|(?:2160|1080|720|576|480)p|uhd|fhd|hd|sd|hdr10\+?|hdr|dolby[ ._-]*vision|dv|hevc|x26[45]|h[ .]?26[45]|multi(?:[ ._-]*(?:audio|sub(?:title)?s?))?)"
+BRACKETED_QUALITY = re.compile(rf"\s*[\[({{]\s*{QUALITY_TOKEN}\s*[\])}}]\s*", re.IGNORECASE)
+LEADING_QUALITY = re.compile(rf"^\s*{QUALITY_TOKEN}\s*(?:[-|•:]\s*)", re.IGNORECASE)
+TRAILING_QUALITY = re.compile(rf"\s*(?:[-|•]\s*){QUALITY_TOKEN}\s*$", re.IGNORECASE)
+TRAILING_BRACKETED_YEAR = re.compile(r"\s*[\[({](19\d{2}|20\d{2})[\])}]\s*$")
+TRAILING_SEPARATED_YEAR = re.compile(r"\s*(?:[-|]\s*|\s+)(19\d{2}|20\d{2})\s*$")
 
 
 class SyncError(RuntimeError):
@@ -57,6 +64,8 @@ DEFAULTS: dict[str, Any] = {
     "movies_directory": "Movies",
     "series_directory": "TV Shows",
     "category_directories": True,
+    "normalize_names": True,
+    "strip_name_prefixes": ["US:", "UK:", "|EN|"],
     "include_categories": [],
     "exclude_categories": [],
     "clean_stale": True,
@@ -233,16 +242,16 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     if args.sample_size is not None:
         config["sample_size"] = args.sample_size
 
-    for field in ("sync_movies", "sync_series", "category_directories", "clean_stale", "allow_empty_library", "verify_tls"):
+    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "clean_stale", "allow_empty_library", "verify_tls"):
         config[field] = as_bool(config[field], field)
     if not config["sync_movies"] and not config["sync_series"]:
         raise SyncError("at least one of sync_movies or sync_series must be enabled")
     for field in ("server_url", "username", "password", "output_dir"):
         if not str(config[field]).strip():
             raise SyncError(f"missing required setting: {field}")
-    for field in ("include_categories", "exclude_categories"):
+    for field in ("include_categories", "exclude_categories", "strip_name_prefixes"):
         if not isinstance(config[field], list) or not all(isinstance(item, str) for item in config[field]):
-            raise SyncError(f"{field} must be a list of category names")
+            raise SyncError(f"{field} must be a list of strings")
     try:
         config["request_timeout"] = float(config["request_timeout"])
         config["retries"] = int(config["retries"])
@@ -348,6 +357,57 @@ def movie_year(item: dict[str, Any]) -> str | None:
     return None
 
 
+def normalize_media_name(value: Any, config: dict[str, Any], fallback: str) -> str:
+    name = html.unescape(str(value or ""))
+    name = unicodedata.normalize("NFKC", name)
+    name = name.replace("\u2013", " - ").replace("\u2014", " - ").replace("\u00b7", " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    if config["normalize_names"]:
+        name = BRACKETED_QUALITY.sub(" ", name)
+        name = LEADING_QUALITY.sub("", name)
+        name = TRAILING_QUALITY.sub("", name)
+        prefixes = sorted((prefix for prefix in config["strip_name_prefixes"] if prefix), key=len, reverse=True)
+        removed = True
+        while removed and name:
+            removed = False
+            for prefix in prefixes:
+                if name.casefold().startswith(prefix.casefold()):
+                    name = name[len(prefix):].lstrip(" |:-")
+                    removed = True
+                    break
+        name = re.sub(r"\s+", " ", name).strip(" -|•")
+    return safe_name(name, fallback)
+
+
+def canonical_media_title(value: Any, item: dict[str, Any], config: dict[str, Any], fallback: str) -> str:
+    title = normalize_media_name(value, config, fallback)
+    if not config["normalize_names"]:
+        return title
+    metadata_year = movie_year(item)
+    bracketed = TRAILING_BRACKETED_YEAR.search(title)
+    separated = TRAILING_SEPARATED_YEAR.search(title)
+    title_year = bracketed.group(1) if bracketed else (separated.group(1) if separated else None)
+    year = metadata_year or title_year
+    year_match = bracketed or separated
+    if year_match and title[:year_match.start()].strip(" -|([{ "):
+        if bracketed or not metadata_year or title_year == metadata_year:
+            title = title[:year_match.start()].rstrip(" -|")
+            title = TRAILING_QUALITY.sub("", title).rstrip(" -|")
+    if year and not re.search(rf"\({re.escape(year)}\)$", title):
+        title = f"{title} ({year})"
+    return safe_name(title, fallback)
+
+
+def parse_number(value: Any, fallback: int, specials_are_zero: bool = False) -> int:
+    text = str(value or "").strip()
+    if specials_are_zero and text.casefold() in {"special", "specials", "extra", "extras"}:
+        return 0
+    match = re.search(r"\d+", text)
+    if not match:
+        return fallback
+    return max(0, int(match.group(0)))
+
+
 def unique_entries(entries: Iterable[Entry]) -> list[Entry]:
     """Resolve provider-side duplicate titles without overwriting either stream."""
     used: set[str] = set()
@@ -376,9 +436,7 @@ def collect_movies(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
         category = categories.get(str(item.get("category_id")), "Uncategorized")
         if not category_allowed(category, config):
             continue
-        title = safe_name(item.get("name"), f"Movie {item['stream_id']}")
-        year = movie_year(item)
-        display = title if not year or YEAR_PATTERN.search(title) else f"{title} ({year})"
+        display = canonical_media_title(item.get("name"), item, config, f"Movie {item['stream_id']}")
         folder = with_category(config["movies_directory"], category, config) / display
         path = folder / f"{display}.strm"
         entries.append(Entry(path, client.stream_url("movie", item["stream_id"], item.get("container_extension"))))
@@ -389,10 +447,7 @@ def collect_movies(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
 
 def episode_number(item: dict[str, Any], fallback: int) -> int:
     value = item.get("episode_num", item.get("episode_number", fallback))
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return fallback
+    return parse_number(value, fallback)
 
 
 def iter_episodes(payload: Any) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -411,10 +466,7 @@ def iter_episodes(payload: Any) -> Iterable[tuple[int, dict[str, Any]]]:
         for index, episode in enumerate(group, start=1):
             if not isinstance(episode, dict) or episode.get("id") is None:
                 continue
-            try:
-                season = int(episode.get("season", season_key))
-            except (TypeError, ValueError):
-                season = 0
+            season = parse_number(episode.get("season", season_key), 0, specials_are_zero=True)
             yield max(0, season), {**episode, "_fallback_number": index}
 
 
@@ -431,12 +483,12 @@ def collect_series(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
         category = categories.get(str(show.get("category_id")), "Uncategorized")
         if not category_allowed(category, config):
             continue
-        show_name = safe_name(show.get("name"), f"Series {show['series_id']}")
+        show_name = canonical_media_title(show.get("name"), show, config, f"Series {show['series_id']}")
         LOG.info("Reading series %d/%d: %s", position, total, show_name)
         detail = client.api("get_series_info", series_id=show["series_id"])
         for season, episode in iter_episodes(detail):
             number = episode_number(episode, episode["_fallback_number"])
-            episode_title = safe_name(episode.get("title"), f"Episode {number}")
+            episode_title = normalize_media_name(episode.get("title"), config, f"Episode {number}")
             code = f"S{season:02d}E{number:02d}"
             folder = with_category(config["series_directory"], category, config) / show_name / f"Season {season:02d}"
             filename = safe_name(f"{show_name} - {code} - {episode_title}") + ".strm"
