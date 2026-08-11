@@ -6,10 +6,60 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3.10 or newer is required. Install python3 and run this again." >&2
-  exit 1
+install_dependencies() {
+  need_python=$1
+  need_curl=$2
+
+  if command -v apt-get >/dev/null 2>&1; then
+    packages=""
+    if [ "$need_python" = yes ]; then packages="$packages python3"; fi
+    if [ "$need_curl" = yes ]; then packages="$packages curl"; fi
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y $packages
+  elif command -v dnf >/dev/null 2>&1; then
+    packages=""
+    if [ "$need_python" = yes ]; then packages="$packages python3"; fi
+    if [ "$need_curl" = yes ]; then packages="$packages curl"; fi
+    dnf install -y $packages
+  elif command -v yum >/dev/null 2>&1; then
+    packages=""
+    if [ "$need_python" = yes ]; then packages="$packages python3"; fi
+    if [ "$need_curl" = yes ]; then packages="$packages curl"; fi
+    yum install -y $packages
+  elif command -v zypper >/dev/null 2>&1; then
+    packages=""
+    if [ "$need_python" = yes ]; then packages="$packages python3"; fi
+    if [ "$need_curl" = yes ]; then packages="$packages curl"; fi
+    zypper --non-interactive install $packages
+  elif command -v apk >/dev/null 2>&1; then
+    packages=""
+    if [ "$need_python" = yes ]; then packages="$packages python3"; fi
+    if [ "$need_curl" = yes ]; then packages="$packages curl"; fi
+    apk add --no-cache $packages
+  elif command -v pacman >/dev/null 2>&1; then
+    packages=""
+    if [ "$need_python" = yes ]; then packages="$packages python"; fi
+    if [ "$need_curl" = yes ]; then packages="$packages curl"; fi
+    pacman -Sy --noconfirm $packages
+  else
+    echo "Could not find a supported package manager." >&2
+    echo "Install Python 3.10+ and curl manually, then run this installer again." >&2
+    exit 1
+  fi
+}
+
+NEED_PYTHON=no
+NEED_CURL=no
+command -v python3 >/dev/null 2>&1 || NEED_PYTHON=yes
+command -v curl >/dev/null 2>&1 || NEED_CURL=yes
+
+if [ "$NEED_PYTHON" = yes ] || [ "$NEED_CURL" = yes ]; then
+  echo "Installing missing runtime requirements..."
+  install_dependencies "$NEED_PYTHON" "$NEED_CURL"
 fi
+
+command -v python3 >/dev/null 2>&1 || { echo "Python installation failed." >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "curl installation failed." >&2; exit 1; }
 
 if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
   echo "Python 3.10 or newer is required. Upgrade python3 and run this again." >&2
