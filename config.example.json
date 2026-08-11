@@ -12,6 +12,7 @@
   "exclude_categories": ["Adult"],
   "clean_stale": true,
   "allow_empty_library": false,
+  "sample_size": 0,
   "request_timeout": 30,
   "retries": 3,
   "verify_tls": true,
