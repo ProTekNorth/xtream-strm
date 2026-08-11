@@ -8,6 +8,8 @@
   "movies_directory": "Movies",
   "series_directory": "TV Shows",
   "category_directories": true,
+  "normalize_names": true,
+  "strip_name_prefixes": ["US:", "UK:", "|EN|"],
   "include_categories": [],
   "exclude_categories": ["Adult"],
   "clean_stale": true,
