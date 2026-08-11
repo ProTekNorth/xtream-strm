@@ -13,6 +13,13 @@ curl -fsSL https://raw.githubusercontent.com/ProTekNorth/xtream-strm/main/bootst
 sudo sh /tmp/install-xtream-strm.sh
 ```
 
+If curl is not installed yet, use wget to fetch the bootstrapper; it will install curl before continuing:
+
+```bash
+wget -qO /tmp/install-xtream-strm.sh https://raw.githubusercontent.com/ProTekNorth/xtream-strm/main/bootstrap.sh
+sudo sh /tmp/install-xtream-strm.sh
+```
+
 Alternatively, clone the repository:
 
 ```bash
@@ -22,6 +29,8 @@ sudo sh install.sh
 ```
 
 The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. It checks the login and creates a five-item sample first. You can inspect that sample before approving the complete sync and six-hour schedule.
+
+If Python 3 or curl is missing, the installer installs it automatically using `apt`, `dnf`, `yum`, `zypper`, `apk`, or `pacman`. Python 3.10 or newer is required.
 
 ## Test with a small batch first
 
