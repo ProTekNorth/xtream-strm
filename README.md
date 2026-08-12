@@ -44,6 +44,8 @@ The menu can run a complete sync or resumable batch in the terminal with live pr
 
 The exporter uses multiple worker threads to load TV-show details and create STRM files concurrently. The default is eight workers. Change it through **Reconfigure settings → Sync behavior** if a provider requires fewer connections or the storage can handle more. One worker disables concurrency; the supported range is 1–32. Sample mode intentionally reads shows sequentially so a small test does not request the entire TV catalog.
 
+For complete syncs, the exporter saves a private write checkpoint after all provider catalogs and TV-show details have been read. If writing is interrupted, running the same sync again resumes from that checkpoint and does not reread every show. The checkpoint is removed automatically only after all STRM files and the manifest are written successfully. Changing the provider, selected groups, media folders, or naming behavior intentionally invalidates the old checkpoint. Batch mode continues to use its existing per-show progress file instead.
+
 ## Test with a small batch first
 
 Preview five movies and five episodes without writing anything:
