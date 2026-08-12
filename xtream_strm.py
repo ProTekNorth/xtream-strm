@@ -16,6 +16,8 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -24,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -120,6 +122,27 @@ class ProgressBar:
         self.finish("failed" if exc_type else self.detail)
 
 
+def threaded_map(function: Any, items: Iterable[Any], workers: int) -> Iterable[Any]:
+    """Map with bounded pending work so very large catalogs do not exhaust memory."""
+    iterator = iter(items)
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xtream")
+    pending: deque[Any] = deque()
+    try:
+        for _ in range(workers * 2):
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                break
+        while pending:
+            yield pending.popleft().result()
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                pass
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 DEFAULTS: dict[str, Any] = {
     "server_url": "",
     "username": "",
@@ -150,6 +173,7 @@ DEFAULTS: dict[str, Any] = {
     "jellyfin_verify_tls": True,
     "request_timeout": 30,
     "retries": 3,
+    "workers": 8,
     "verify_tls": True,
     "file_mode": "0640",
     "directory_mode": "0750",
@@ -402,6 +426,13 @@ def interactive_setup(path: Path) -> None:
             raise SyncError("default batch size must be between 0 and 10000")
         if config["batch_size"]:
             config["sample_size"] = 0
+        workers = prompt("Concurrent workers", str(config["workers"]))
+        try:
+            config["workers"] = int(workers)
+        except ValueError as exc:
+            raise SyncError("concurrent workers must be a number") from exc
+        if not 1 <= config["workers"] <= 32:
+            raise SyncError("concurrent workers must be between 1 and 32")
 
     if "provider" in sections or "content" in sections:
         for field in ("server_url", "username", "password"):
@@ -493,14 +524,17 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     try:
         config["request_timeout"] = float(config["request_timeout"])
         config["retries"] = int(config["retries"])
+        config["workers"] = int(config["workers"])
         config["sample_size"] = int(config["sample_size"])
         config["batch_size"] = int(config["batch_size"])
         config["jellyfin_poll_seconds"] = int(config["jellyfin_poll_seconds"])
         config["jellyfin_scan_timeout"] = int(config["jellyfin_scan_timeout"])
     except (TypeError, ValueError) as exc:
-        raise SyncError("request_timeout, retries, sample_size, batch_size, and Jellyfin timing settings must be numeric") from exc
+        raise SyncError("request_timeout, retries, workers, sample_size, batch_size, and Jellyfin timing settings must be numeric") from exc
     if config["request_timeout"] <= 0 or not 1 <= config["retries"] <= 10:
         raise SyncError("request_timeout must be positive and retries must be between 1 and 10")
+    if not 1 <= config["workers"] <= 32:
+        raise SyncError("workers must be between 1 and 32")
     if not 0 <= config["sample_size"] <= 1000:
         raise SyncError("sample_size must be between 0 and 1000")
     if not 0 <= config["batch_size"] <= 10000:
@@ -936,12 +970,8 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
     series = client.api("get_series")
     if not isinstance(series, list):
         raise SyncError("provider returned an invalid series list")
-    entries = []
-    total = len(series)
-    progress = ProgressBar("Reading TV shows", total, enabled=None if total else False)
-    progress.update(0)
-    for position, show in enumerate(series, start=1):
-        progress.update(position, str(show.get("name", "")) if isinstance(show, dict) else "")
+    candidates: list[tuple[dict[str, Any], str]] = []
+    for show in series:
         if not isinstance(show, dict) or show.get("series_id") is None:
             continue
         series_id = str(show["series_id"])
@@ -950,26 +980,48 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         category = categories.get(str(show.get("category_id")), "Uncategorized")
         if not category_allowed(show.get("category_id"), category, "series", config):
             continue
+        candidates.append((show, category))
+        if batch and len(candidates) >= config["batch_size"]:
+            break
+
+    def fetch_show(candidate: tuple[dict[str, Any], str]) -> tuple[str, str, list[Entry]]:
+        show, category = candidate
+        series_id = str(show["series_id"])
         detail = client.api("get_series_info", show_progress=False, series_id=show["series_id"])
         info = detail.get("info", {}) if isinstance(detail, dict) else {}
         metadata = {**show, **(info if isinstance(info, dict) else {})}
         show_name = canonical_media_title(show.get("name"), metadata, config, f"Series {show['series_id']}")
         episode_show_name = JELLYFIN_PROVIDER_ID.sub("", show_name).strip()
-        LOG.debug("Reading series %d/%d: %s", position, total, show_name)
+        show_entries: list[Entry] = []
         for season, episode in iter_episodes(detail):
             number = episode_number(episode, episode["_fallback_number"])
             episode_title = normalize_media_name(episode.get("title"), config, f"Episode {number}")
             code = f"S{season:02d}E{number:02d}"
             folder = with_category(config["series_directory"], category, config) / show_name / f"Season {season:02d}"
             filename = safe_name(f"{episode_show_name} - {code} - {episode_title}") + ".strm"
-            entries.append(Entry(folder / filename, client.stream_url("series", episode["id"], episode.get("container_extension"))))
-            if config["sample_size"] and len(entries) >= config["sample_size"]:
-                progress.finish(f"{len(entries)} episodes selected")
-                return unique_entries(entries)
+            show_entries.append(Entry(
+                folder / filename,
+                client.stream_url("series", episode["id"], episode.get("container_extension")),
+            ))
+        return series_id, show_name, show_entries
+
+    entries: list[Entry] = []
+    total = len(candidates)
+    progress = ProgressBar("Reading TV shows", total, enabled=None if total else False)
+    progress.update(0)
+    if config["sample_size"] or config["workers"] == 1 or total < 2:
+        results: Iterable[tuple[str, str, list[Entry]]] = map(fetch_show, candidates)
+    else:
+        results = threaded_map(fetch_show, candidates, min(config["workers"], total))
+    for position, (series_id, show_name, show_entries) in enumerate(results, start=1):
+        progress.update(position, show_name)
+        LOG.debug("Read series %d/%d: %s", position, total, show_name)
+        entries.extend(show_entries)
         if batch:
             batch.new_series.add(series_id)
-            if len(batch.new_series) >= config["batch_size"]:
-                break
+        if config["sample_size"] and len(entries) >= config["sample_size"]:
+            entries = entries[:config["sample_size"]]
+            break
     progress.finish(f"{len(entries)} episodes selected")
     return unique_entries(entries)
 
@@ -1092,8 +1144,8 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
     write_label = "Checking STRM files" if dry_run else "Writing STRM files"
     write_progress = ProgressBar(write_label, len(entries), enabled=None if entries else False)
     write_progress.update(0)
-    for position, entry in enumerate(entries, start=1):
-        write_progress.update(position, entry.relative_path.name)
+
+    def apply_entry(entry: Entry) -> tuple[str, str]:
         target = output / entry.relative_path
         content = entry.stream_url + "\n"
         try:
@@ -1101,17 +1153,26 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
         except OSError as exc:
             raise SyncError(f"could not read {target}: {exc}") from exc
         if existing == content:
-            stats.unchanged += 1
+            result = "unchanged"
         elif existing is None:
-            stats.created += 1
+            result = "created"
             LOG.debug("Create %s", entry.relative_path)
             if not dry_run:
                 atomic_write(target, content, config["file_mode"], config["directory_mode"])
         else:
-            stats.updated += 1
+            result = "updated"
             LOG.debug("Update %s", entry.relative_path)
             if not dry_run:
                 atomic_write(target, content, config["file_mode"], config["directory_mode"])
+        return result, entry.relative_path.name
+
+    if config["workers"] == 1 or len(entries) < 2:
+        write_results: Iterable[tuple[str, str]] = map(apply_entry, entries)
+    else:
+        write_results = threaded_map(apply_entry, entries, min(config["workers"], len(entries)))
+    for position, (result, filename) in enumerate(write_results, start=1):
+        setattr(stats, result, getattr(stats, result) + 1)
+        write_progress.update(position, filename)
     write_progress.finish()
 
     if config["clean_stale"]:
