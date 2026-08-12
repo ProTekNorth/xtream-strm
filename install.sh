@@ -175,7 +175,8 @@ if id jellyfin >/dev/null 2>&1; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now xtream-strm-web.service
+systemctl enable xtream-strm-web.service
+systemctl restart xtream-strm-web.service
 
 DASHBOARD_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 DASHBOARD_IP=${DASHBOARD_IP:-127.0.0.1}
