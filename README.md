@@ -115,7 +115,9 @@ Command-line connection settings override environment variables, which override 
 - `include_categories`: exact, case-insensitive category names to include; empty means all.
 - `exclude_categories`: exact, case-insensitive names to skip.
 - `normalize_names`: produce consistent media-server names by cleaning Unicode, HTML entities, whitespace, quality tags, release years, episode numbers, and season numbers.
+- `auto_strip_name_tags`: remove short uppercase provider tags before a separator, such as `PS -`, `SOM -`, `VIP:`, or `[ABC]`.
 - `strip_name_prefixes`: case-insensitive provider prefixes to remove from movie and show names, such as `US:`, `UK:`, or `|EN|`.
+- `preserve_name_prefixes`: uppercase prefixes that automatic detection must retain when they are part of a legitimate title.
 - `category_directories`: place titles beneath their provider category.
 - `clean_stale`: remove missing files created by earlier successful syncs.
 - `allow_empty_library`: permit an empty provider response to clear a selected library. It is disabled by default to protect against temporary provider problems and category-filter mistakes.
