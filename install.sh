@@ -88,9 +88,11 @@ install -d -m 0755 "$INSTALL_DIR"
 install -d -o root -g media -m 0750 "$CONFIG_DIR"
 install -m 0755 "$SCRIPT_DIR/xtream_strm.py" "$INSTALL_DIR/xtream_strm.py"
 
+EXISTING_CONFIG=no
 RECONFIGURE=yes
 if [ -f "$CONFIG_FILE" ]; then
-  printf "An existing configuration was found. Reconfigure it? [y/N]: "
+  EXISTING_CONFIG=yes
+  printf "An existing configuration was found. Open the reconfiguration menu? [y/N]: "
   read -r answer
   case "$answer" in
     y|Y|yes|YES) RECONFIGURE=yes ;;
@@ -159,6 +161,14 @@ if id jellyfin >/dev/null 2>&1; then
 fi
 
 systemctl daemon-reload
+
+if [ "$EXISTING_CONFIG" = yes ]; then
+  echo ""
+  echo "Xtream STRM was updated successfully. Your existing library was not restarted or re-imported."
+  echo "Run a sync whenever you are ready:"
+  echo "  sudo systemctl start xtream-strm.service"
+  exit 0
+fi
 
 echo ""
 echo "Running a small sample sync before processing the full library..."
