@@ -17,6 +17,17 @@
   "exclude_categories": ["Adult"],
   "movie_category_ids": [],
   "series_category_ids": [],
+  "providers": [
+    {
+      "name": "Primary Provider",
+      "server_url": "https://provider.example.com:443",
+      "username": "your-username",
+      "password": "your-password",
+      "movie_category_ids": [],
+      "series_category_ids": [],
+      "verify_tls": true
+    }
+  ],
   "clean_stale": true,
   "allow_empty_library": false,
   "sample_size": 0,
