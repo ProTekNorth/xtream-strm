@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -1248,6 +1248,16 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
         content = entry.stream_url + "\n"
         try:
             existing = target.read_text(encoding="utf-8") if target.exists() else None
+        except PermissionError:
+            LOG.warning("Replacing unreadable managed STRM file: %s", entry.relative_path)
+            if not dry_run:
+                try:
+                    atomic_write(target, content, config["file_mode"], config["directory_mode"])
+                except OSError as exc:
+                    raise SyncError(
+                        f"could not replace unreadable {target}; check the NFS directory ownership: {exc}"
+                    ) from exc
+            return "updated", entry.relative_path.name
         except OSError as exc:
             raise SyncError(f"could not read {target}: {exc}") from exc
         if existing == content:
