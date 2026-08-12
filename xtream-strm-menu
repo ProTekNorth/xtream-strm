@@ -1,0 +1,145 @@
+#!/bin/sh
+set -u
+
+PROGRAM=/opt/xtream-strm/xtream_strm.py
+CONFIG=/etc/xtream-strm/config.json
+SERVICE=xtream-strm.service
+TIMER=xtream-strm.timer
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Opening Xtream STRM requires administrator access."
+  exec sudo "$0" "$@"
+fi
+
+if [ ! -x "$PROGRAM" ] || [ ! -f "$CONFIG" ]; then
+  echo "Xtream STRM is not fully installed. Run the internet installer first." >&2
+  exit 1
+fi
+
+pause_menu() {
+  echo ""
+  printf "Press Enter to return to the menu..."
+  read -r unused
+}
+
+service_is_running() {
+  systemctl is-active --quiet "$SERVICE"
+}
+
+run_as_service_user() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u xtream-strm -- "$@"
+  else
+    command_text=""
+    for argument in "$@"; do
+      escaped=$(printf "%s" "$argument" | sed "s/'/'\\\\''/g")
+      command_text="$command_text '$escaped'"
+    done
+    su -s /bin/sh xtream-strm -c "$command_text"
+  fi
+}
+
+visible_sync() {
+  if service_is_running; then
+    echo "A background sync is already running. Choose option 4 to watch it."
+    return
+  fi
+  echo ""
+  echo "The sync will stay in this window and display live progress."
+  run_as_service_user "$PROGRAM" --config "$CONFIG"
+}
+
+visible_batch() {
+  if service_is_running; then
+    echo "A background sync is already running. Choose option 4 to watch it."
+    return
+  fi
+  printf "Batch size [100]: "
+  read -r batch_size
+  batch_size=${batch_size:-100}
+  case "$batch_size" in
+    *[!0-9]*|0) echo "Batch size must be a positive number."; return ;;
+  esac
+  echo ""
+  echo "Running the next resumable batch with live progress."
+  run_as_service_user "$PROGRAM" --config "$CONFIG" --batch "$batch_size"
+}
+
+background_sync() {
+  if service_is_running; then
+    echo "A background sync is already running."
+    return
+  fi
+  systemctl start --no-block "$SERVICE"
+  echo "The sync is now running in the background."
+  echo "Open this menu again and choose option 4 to watch its activity."
+}
+
+watch_background() {
+  echo "Showing background activity. Press Ctrl+C to return to the menu."
+  echo ""
+  journalctl -fu "$SERVICE" || true
+}
+
+show_status() {
+  systemctl --no-pager --full status "$SERVICE" || true
+}
+
+reconfigure() {
+  "$PROGRAM" --setup --config "$CONFIG"
+  chown xtream-strm:root "$CONFIG"
+  chmod 0600 "$CONFIG"
+  echo "Configuration permissions were refreshed for the background service."
+}
+
+scheduled_syncs() {
+  if systemctl is-enabled --quiet "$TIMER"; then
+    printf "Scheduled six-hour syncs are enabled. Disable them? [y/N]: "
+    read -r timer_answer
+    case "$timer_answer" in
+      y|Y|yes|YES)
+        systemctl disable --now "$TIMER"
+        echo "Scheduled syncs were disabled."
+        ;;
+      *) echo "Scheduled syncs remain enabled." ;;
+    esac
+  else
+    printf "Scheduled six-hour syncs are disabled. Enable them? [Y/n]: "
+    read -r timer_answer
+    case "$timer_answer" in
+      n|N|no|NO) echo "Scheduled syncs remain disabled." ;;
+      *)
+        systemctl enable --now "$TIMER"
+        echo "Scheduled syncs were enabled."
+        ;;
+    esac
+  fi
+}
+
+while true; do
+  echo ""
+  echo "Xtream STRM control menu"
+  echo "========================"
+  echo "  1) Sync complete library now (show progress)"
+  echo "  2) Run next resumable batch (show progress)"
+  echo "  3) Start complete sync in background"
+  echo "  4) Watch background activity"
+  echo "  5) Check background sync status"
+  echo "  6) Reconfigure settings"
+  echo "  7) Enable or disable scheduled syncs"
+  echo "  8) Exit"
+  printf "Selection [1]: "
+  read -r choice
+
+  case "${choice:-1}" in
+    1) visible_sync; pause_menu ;;
+    2) visible_batch; pause_menu ;;
+    3) background_sync; pause_menu ;;
+    4) watch_background ;;
+    5) show_status; pause_menu ;;
+    6) reconfigure; pause_menu ;;
+    7) scheduled_syncs; pause_menu ;;
+    8) exit 0 ;;
+    *) echo "Choose a number from 1 through 8." ;;
+  esac
+done
