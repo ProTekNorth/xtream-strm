@@ -32,6 +32,16 @@ The installer asks for the provider address (a full M3U/API link is also accepte
 
 If Python 3 or curl is missing, the installer installs it automatically using `apt`, `dnf`, `yum`, `zypper`, `apk`, or `pacman`. Python 3.10 or newer is required.
 
+## Control menu
+
+After installation, open the interactive control menu with one command:
+
+```bash
+sudo xtream-strm
+```
+
+The menu can run a complete sync or resumable batch in the terminal with live progress, start a complete sync in the background, watch or check that background job, reconfigure selected settings, and enable or disable scheduled six-hour syncs. It prevents a foreground sync from starting while the background service is already active.
+
 ## Test with a small batch first
 
 Preview five movies and five episodes without writing anything:
