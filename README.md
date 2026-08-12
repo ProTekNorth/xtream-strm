@@ -52,6 +52,20 @@ Sample mode never removes unsampled files or drops them from the sync manifest. 
 
 Batch mode remembers completed Xtream stream and series IDs in the output directory. Repeating the same command processes the next group without duplicating completed items. Partial runs never remove items from earlier batches.
 
+For a fully automatic import, create an API key in the Jellyfin administrator dashboard and save the Jellyfin server URL and key through guided setup:
+
+```bash
+sudo /opt/xtream-strm/xtream_strm.py --setup --config /etc/xtream-strm/config.json
+```
+
+Then start continuous mode:
+
+```bash
+sudo -u xtream-strm /opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json --batch 100 --continuous
+```
+
+Continuous mode saves batch progress, starts a supported Jellyfin library scan, waits for the scan task to finish, and automatically creates the next batch. If the command is interrupted or the machine restarts, run the same command again to resume.
+
 For movies, a batch of 1,000 is a reasonable starting point:
 
 ```bash
@@ -64,7 +78,7 @@ Shows are batched as whole shows so seasons are never split. Start smaller becau
 sudo -u xtream-strm /opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json --series-only --batch 100
 ```
 
-Repeat each command after Jellyfin finishes scanning the previous group. The exporter reports when no additional unprocessed movies or shows remain. To intentionally start batch progress over, add `--reset-batch` to the first new batch command. Once the initial import is complete, enable the regular full refresh:
+Without continuous mode, repeat each command after Jellyfin finishes scanning the previous group. The exporter reports when no additional unprocessed movies or shows remain. To intentionally start batch progress over, add `--reset-batch` to the first new batch command. Once the initial import is complete, enable the regular full refresh:
 
 ```bash
 sudo systemctl enable --now xtream-strm.timer
@@ -146,6 +160,10 @@ Command-line connection settings override environment variables, which override 
 - `clean_stale`: remove missing files created by earlier successful syncs.
 - `allow_empty_library`: permit an empty provider response to clear a selected library. It is disabled by default to protect against temporary provider problems and category-filter mistakes.
 - `batch_size`: process only the next remembered group of movies and whole shows. The command-line `--batch` option overrides it.
+- `jellyfin_url` and `jellyfin_api_key`: optional Jellyfin connection used by `--continuous`. Keep the configuration file private because it contains both provider credentials and this key.
+- `jellyfin_poll_seconds`: how often continuous mode checks Jellyfin's library-scan task.
+- `jellyfin_scan_timeout`: maximum seconds to wait for one Jellyfin scan before stopping safely.
+- `jellyfin_verify_tls`: keep enabled unless the local Jellyfin server uses a trusted, known self-signed certificate.
 - `verify_tls`: keep enabled. Disable only for a trusted server with a known self-signed certificate.
 - `file_mode` and `directory_mode`: octal permissions applied to generated content.
 
