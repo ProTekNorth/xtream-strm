@@ -28,7 +28,7 @@ cd xtream-strm
 sudo sh install.sh
 ```
 
-The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. It checks the login and creates a five-item sample first. You can inspect that sample before approving the complete sync and six-hour schedule.
+The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. It checks the login and creates a five-item sample first. You can then choose a gradual initial import, a complete import, or stop after the sample. Gradual import is the recommended choice for very large Jellyfin libraries.
 
 If Python 3 or curl is missing, the installer installs it automatically using `apt`, `dnf`, `yum`, `zypper`, `apk`, or `pacman`. Python 3.10 or newer is required.
 
@@ -46,7 +46,30 @@ To create playable STRM files for that sample, omit `--dry-run`:
 sudo -u xtream-strm /opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json --sample 5
 ```
 
-Sample mode never removes unsampled files or drops them from the sync manifest. When the results look right, start the complete sync with `sudo systemctl start xtream-strm.service`.
+Sample mode never removes unsampled files or drops them from the sync manifest. When the results look right, choose either the gradual import below or start a complete sync with `sudo systemctl start xtream-strm.service`.
+
+## Gradual first import for large libraries
+
+Batch mode remembers completed Xtream stream and series IDs in the output directory. Repeating the same command processes the next group without duplicating completed items. Partial runs never remove items from earlier batches.
+
+For movies, a batch of 1,000 is a reasonable starting point:
+
+```bash
+sudo -u xtream-strm /opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json --movies-only --batch 1000
+```
+
+Shows are batched as whole shows so seasons are never split. Start smaller because one show can contain many episodes:
+
+```bash
+sudo -u xtream-strm /opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json --series-only --batch 100
+```
+
+Repeat each command after Jellyfin finishes scanning the previous group. The exporter reports when no additional unprocessed movies or shows remain. To intentionally start batch progress over, add `--reset-batch` to the first new batch command. Once the initial import is complete, enable the regular full refresh:
+
+```bash
+sudo systemctl enable --now xtream-strm.timer
+sudo systemctl start xtream-strm.service
+```
 
 Useful commands after installation:
 
@@ -73,8 +96,8 @@ The generated layout is:
 
 ```text
 /srv/media/xtream/
-├── Movies/Category/Movie (2026)/Movie (2026).strm
-└── TV Shows/Category/Show/Season 01/Show - S01E01 - Episode.strm
+├── Movies/Category/Movie (2026) [tmdbid-12345]/Movie (2026) [tmdbid-12345].strm
+└── TV Shows/Category/Show (2020) [tmdbid-67890]/Season 01/Show (2020) - S01E01 - Episode.strm
 ```
 
 Point Jellyfin at the `Movies` and `TV Shows` directories as separate libraries. A later run updates changed URLs and removes only stale `.strm` files listed in the tool's own manifest. Use `--keep-stale` to disable removal. Movie-only runs leave the existing series files alone, and vice versa.
@@ -115,12 +138,14 @@ Command-line connection settings override environment variables, which override 
 - `include_categories`: exact, case-insensitive category names to include; empty means all.
 - `exclude_categories`: exact, case-insensitive names to skip.
 - `normalize_names`: produce consistent media-server names by cleaning Unicode, HTML entities, whitespace, quality tags, release years, episode numbers, and season numbers.
+- `add_provider_ids`: append a Jellyfin-compatible TMDB or IMDb ID when that ID is already supplied by the Xtream provider. The exporter does not scrape metadata sites or make extra per-movie metadata requests.
 - `auto_strip_name_tags`: remove short uppercase provider tags before a separator, such as `PS -`, `SOM -`, `VIP:`, or `[ABC]`.
 - `strip_name_prefixes`: case-insensitive provider prefixes to remove from movie and show names, such as `US:`, `UK:`, or `|EN|`.
 - `preserve_name_prefixes`: uppercase prefixes that automatic detection must retain when they are part of a legitimate title.
 - `category_directories`: place titles beneath their provider category.
 - `clean_stale`: remove missing files created by earlier successful syncs.
 - `allow_empty_library`: permit an empty provider response to clear a selected library. It is disabled by default to protect against temporary provider problems and category-filter mistakes.
+- `batch_size`: process only the next remembered group of movies and whole shows. The command-line `--batch` option overrides it.
 - `verify_tls`: keep enabled. Disable only for a trusted server with a known self-signed certificate.
 - `file_mode` and `directory_mode`: octal permissions applied to generated content.
 
