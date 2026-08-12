@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import html
 import json
 import logging
@@ -15,7 +16,7 @@ import sys
 import tempfile
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -23,9 +24,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
+BATCH_STATE_NAME = ".xtream-strm-batch.json"
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
 QUALITY_TOKEN = r"(?:4k|(?:2160|1080|720|576|480)p|uhd|fhd|hd|sd|hdr10\+?|hdr|dolby[ ._-]*vision|dv|hevc|x26[45]|h[ .]?26[45]|multi(?:[ ._-]*(?:audio|sub(?:title)?s?))?)"
@@ -36,6 +38,7 @@ TRAILING_BRACKETED_YEAR = re.compile(r"\s*[\[({](19\d{2}|20\d{2})[\])}]\s*$")
 TRAILING_SEPARATED_YEAR = re.compile(r"\s*(?:[-|]\s*|\s+)(19\d{2}|20\d{2})\s*$")
 LEADING_PROVIDER_TAG = re.compile(r"^(?P<tag>[A-Z][A-Z0-9]{1,5})\s*(?:-\s+|\|\s*|:\s+)")
 LEADING_BRACKETED_TAG = re.compile(r"^[\[({](?P<tag>[A-Z][A-Z0-9]{1,5})[\])}]\s*(?:[-|:]\s*)?")
+JELLYFIN_PROVIDER_ID = re.compile(r"\[(?:tmdb|imdb)id-[^\]]+\]", re.IGNORECASE)
 
 
 class SyncError(RuntimeError):
@@ -56,6 +59,15 @@ class Stats:
     removed: int = 0
 
 
+@dataclass
+class BatchState:
+    account: str
+    movies: set[str] = field(default_factory=set)
+    series: set[str] = field(default_factory=set)
+    new_movies: set[str] = field(default_factory=set)
+    new_series: set[str] = field(default_factory=set)
+
+
 DEFAULTS: dict[str, Any] = {
     "server_url": "",
     "username": "",
@@ -67,6 +79,7 @@ DEFAULTS: dict[str, Any] = {
     "series_directory": "TV Shows",
     "category_directories": True,
     "normalize_names": True,
+    "add_provider_ids": True,
     "auto_strip_name_tags": True,
     "strip_name_prefixes": ["US:", "UK:", "|EN|"],
     "preserve_name_prefixes": ["IT"],
@@ -75,6 +88,7 @@ DEFAULTS: dict[str, Any] = {
     "clean_stale": True,
     "allow_empty_library": False,
     "sample_size": 0,
+    "batch_size": 0,
     "request_timeout": 30,
     "retries": 3,
     "verify_tls": True,
@@ -245,8 +259,10 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         config["clean_stale"] = False
     if args.sample_size is not None:
         config["sample_size"] = args.sample_size
+    if args.batch_size is not None:
+        config["batch_size"] = args.batch_size
 
-    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "auto_strip_name_tags", "clean_stale", "allow_empty_library", "verify_tls"):
+    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "add_provider_ids", "auto_strip_name_tags", "clean_stale", "allow_empty_library", "verify_tls"):
         config[field] = as_bool(config[field], field)
     if not config["sync_movies"] and not config["sync_series"]:
         raise SyncError("at least one of sync_movies or sync_series must be enabled")
@@ -260,12 +276,17 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         config["request_timeout"] = float(config["request_timeout"])
         config["retries"] = int(config["retries"])
         config["sample_size"] = int(config["sample_size"])
+        config["batch_size"] = int(config["batch_size"])
     except (TypeError, ValueError) as exc:
-        raise SyncError("request_timeout, retries, and sample_size must be numeric") from exc
+        raise SyncError("request_timeout, retries, sample_size, and batch_size must be numeric") from exc
     if config["request_timeout"] <= 0 or not 1 <= config["retries"] <= 10:
         raise SyncError("request_timeout must be positive and retries must be between 1 and 10")
     if not 0 <= config["sample_size"] <= 1000:
         raise SyncError("sample_size must be between 0 and 1000")
+    if not 0 <= config["batch_size"] <= 10000:
+        raise SyncError("batch_size must be between 0 and 10000")
+    if config["sample_size"] and config["batch_size"]:
+        raise SyncError("sample_size and batch_size cannot both be enabled")
     config["server_url"] = normalize_server_url(str(config["server_url"]))
     config["output_dir"] = Path(str(config["output_dir"])).expanduser().resolve()
     config["file_mode"] = parse_mode(config["file_mode"], "file_mode")
@@ -361,6 +382,36 @@ def movie_year(item: dict[str, Any]) -> str | None:
     return None
 
 
+def provider_id_suffix(item: dict[str, Any]) -> str | None:
+    """Return one validated Jellyfin provider-id suffix, preferring TMDB."""
+    normalized = {re.sub(r"[^a-z]", "", str(key).casefold()): value for key, value in item.items()}
+    for key in ("tmdbid", "tmdb"):
+        value = str(normalized.get(key, "")).strip()
+        match = re.search(r"(?<!\d)(\d{1,10})(?!\d)", value)
+        if match:
+            return f"[tmdbid-{match.group(1)}]"
+    for key in ("imdbid", "imdb"):
+        value = str(normalized.get(key, "")).strip()
+        match = re.search(r"tt\d{5,10}", value, re.IGNORECASE)
+        if match:
+            return f"[imdbid-{match.group(0).lower()}]"
+        numeric = re.fullmatch(r"\d{5,10}", value)
+        if numeric:
+            return f"[imdbid-tt{numeric.group(0)}]"
+    return None
+
+
+def add_jellyfin_provider_id(title: str, item: dict[str, Any], config: dict[str, Any], fallback: str) -> str:
+    if not config["add_provider_ids"] or JELLYFIN_PROVIDER_ID.search(title):
+        return safe_name(title, fallback)
+    suffix = provider_id_suffix(item)
+    if not suffix:
+        return safe_name(title, fallback)
+    title_limit = 180 - len(suffix.encode("utf-8")) - 1
+    base = safe_name(title, fallback, max_bytes=title_limit)
+    return safe_name(f"{base} {suffix}", fallback)
+
+
 def normalize_media_name(value: Any, config: dict[str, Any], fallback: str) -> str:
     name = html.unescape(str(value or ""))
     name = unicodedata.normalize("NFKC", name)
@@ -399,7 +450,7 @@ def normalize_media_name(value: Any, config: dict[str, Any], fallback: str) -> s
 def canonical_media_title(value: Any, item: dict[str, Any], config: dict[str, Any], fallback: str) -> str:
     title = normalize_media_name(value, config, fallback)
     if not config["normalize_names"]:
-        return title
+        return add_jellyfin_provider_id(title, item, config, fallback)
     metadata_year = movie_year(item)
     bracketed = TRAILING_BRACKETED_YEAR.search(title)
     separated = TRAILING_SEPARATED_YEAR.search(title)
@@ -412,7 +463,7 @@ def canonical_media_title(value: Any, item: dict[str, Any], config: dict[str, An
             title = TRAILING_QUALITY.sub("", title).rstrip(" -|")
     if year and not re.search(rf"\({re.escape(year)}\)$", title):
         title = f"{title} ({year})"
-    return safe_name(title, fallback)
+    return add_jellyfin_provider_id(title, item, config, fallback)
 
 
 def parse_number(value: Any, fallback: int, specials_are_zero: bool = False) -> int:
@@ -441,7 +492,7 @@ def unique_entries(entries: Iterable[Entry]) -> list[Entry]:
     return result
 
 
-def collect_movies(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
+def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchState | None = None) -> list[Entry]:
     categories = category_map(client.api("get_vod_categories"))
     streams = client.api("get_vod_streams")
     if not isinstance(streams, list):
@@ -450,6 +501,9 @@ def collect_movies(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
     for item in streams:
         if not isinstance(item, dict) or item.get("stream_id") is None:
             continue
+        stream_id = str(item["stream_id"])
+        if batch and stream_id in batch.movies:
+            continue
         category = categories.get(str(item.get("category_id")), "Uncategorized")
         if not category_allowed(category, config):
             continue
@@ -457,6 +511,10 @@ def collect_movies(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
         folder = with_category(config["movies_directory"], category, config) / display
         path = folder / f"{display}.strm"
         entries.append(Entry(path, client.stream_url("movie", item["stream_id"], item.get("container_extension"))))
+        if batch:
+            batch.new_movies.add(stream_id)
+            if len(batch.new_movies) >= config["batch_size"]:
+                break
         if config["sample_size"] and len(entries) >= config["sample_size"]:
             break
     return unique_entries(entries)
@@ -487,7 +545,7 @@ def iter_episodes(payload: Any) -> Iterable[tuple[int, dict[str, Any]]]:
             yield max(0, season), {**episode, "_fallback_number": index}
 
 
-def collect_series(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
+def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchState | None = None) -> list[Entry]:
     categories = category_map(client.api("get_series_categories"))
     series = client.api("get_series")
     if not isinstance(series, list):
@@ -497,21 +555,31 @@ def collect_series(client: XtreamClient, config: dict[str, Any]) -> list[Entry]:
     for position, show in enumerate(series, start=1):
         if not isinstance(show, dict) or show.get("series_id") is None:
             continue
+        series_id = str(show["series_id"])
+        if batch and series_id in batch.series:
+            continue
         category = categories.get(str(show.get("category_id")), "Uncategorized")
         if not category_allowed(category, config):
             continue
-        show_name = canonical_media_title(show.get("name"), show, config, f"Series {show['series_id']}")
-        LOG.info("Reading series %d/%d: %s", position, total, show_name)
         detail = client.api("get_series_info", series_id=show["series_id"])
+        info = detail.get("info", {}) if isinstance(detail, dict) else {}
+        metadata = {**show, **(info if isinstance(info, dict) else {})}
+        show_name = canonical_media_title(show.get("name"), metadata, config, f"Series {show['series_id']}")
+        episode_show_name = JELLYFIN_PROVIDER_ID.sub("", show_name).strip()
+        LOG.info("Reading series %d/%d: %s", position, total, show_name)
         for season, episode in iter_episodes(detail):
             number = episode_number(episode, episode["_fallback_number"])
             episode_title = normalize_media_name(episode.get("title"), config, f"Episode {number}")
             code = f"S{season:02d}E{number:02d}"
             folder = with_category(config["series_directory"], category, config) / show_name / f"Season {season:02d}"
-            filename = safe_name(f"{show_name} - {code} - {episode_title}") + ".strm"
+            filename = safe_name(f"{episode_show_name} - {code} - {episode_title}") + ".strm"
             entries.append(Entry(folder / filename, client.stream_url("series", episode["id"], episode.get("container_extension"))))
             if config["sample_size"] and len(entries) >= config["sample_size"]:
                 return unique_entries(entries)
+        if batch:
+            batch.new_series.add(series_id)
+            if len(batch.new_series) >= config["batch_size"]:
+                break
     return unique_entries(entries)
 
 
@@ -527,6 +595,45 @@ def read_manifest(output: Path) -> set[str]:
         return {str(item) for item in files if isinstance(item, str)}
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise SyncError(f"could not read existing manifest {path}: {exc}") from exc
+
+
+def account_fingerprint(config: dict[str, Any]) -> str:
+    identity = f"{config['server_url']}\0{config['username']}".encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def load_batch_state(config: dict[str, Any], reset: bool = False) -> BatchState:
+    account = account_fingerprint(config)
+    path: Path = config["output_dir"] / BATCH_STATE_NAME
+    if reset or not path.exists():
+        return BatchState(account)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != 1 or not isinstance(data.get("movies"), list) or not isinstance(data.get("series"), list):
+            raise ValueError("unsupported state format")
+        if data.get("account") != account:
+            raise SyncError("batch progress belongs to a different provider account; use --reset-batch to start new progress")
+        return BatchState(account, {str(value) for value in data["movies"]}, {str(value) for value in data["series"]})
+    except SyncError:
+        raise
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SyncError(f"could not read batch progress {path}: {exc}") from exc
+
+
+def save_batch_state(config: dict[str, Any], state: BatchState) -> None:
+    state.movies.update(state.new_movies)
+    state.series.update(state.new_series)
+    state.new_movies.clear()
+    state.new_series.clear()
+    payload = {
+        "version": 1,
+        "account": state.account,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "movies": sorted(state.movies),
+        "series": sorted(state.series),
+    }
+    path: Path = config["output_dir"] / BATCH_STATE_NAME
+    atomic_write(path, json.dumps(payload, indent=2) + "\n", config["file_mode"], config["directory_mode"])
 
 
 def safe_manifest_target(output: Path, relative: str) -> Path | None:
@@ -578,13 +685,13 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
     output: Path = config["output_dir"]
     old_files = read_manifest(output) if output.exists() else set()
     new_files = {entry.relative_path.as_posix() for entry in entries}
-    sample_mode = config["sample_size"] > 0
+    partial_mode = config["sample_size"] > 0 or config["batch_size"] > 0
     active_roots = set()
     if config["sync_movies"]:
         active_roots.add(config["movies_directory"].casefold())
     if config["sync_series"]:
         active_roots.add(config["series_directory"].casefold())
-    old_managed_files = set() if sample_mode else {
+    old_managed_files = set() if partial_mode else {
         relative
         for relative in old_files
         if PurePosixPath(relative).parts and PurePosixPath(relative).parts[0].casefold() in active_roots
@@ -644,7 +751,10 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--movies-only", action="store_true", help="export movies only")
     selection.add_argument("--series-only", action="store_true", help="export series only")
     parser.add_argument("--keep-stale", action="store_true", help="do not remove files missing from the provider")
-    parser.add_argument("--sample", dest="sample_size", nargs="?", type=int, const=5, metavar="SIZE", help="process a small sample (default: 5 per selected library)")
+    sizing = parser.add_mutually_exclusive_group()
+    sizing.add_argument("--sample", dest="sample_size", nargs="?", type=int, const=5, metavar="SIZE", help="process a small sample (default: 5 per selected library)")
+    sizing.add_argument("--batch", dest="batch_size", nargs="?", type=int, const=100, metavar="SIZE", help="process the next resumable batch (default: 100 movies or shows)")
+    parser.add_argument("--reset-batch", action="store_true", help="restart resumable batch progress for this provider")
     parser.add_argument("--dry-run", action="store_true", help="show what would change without writing files")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase logging detail")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -659,25 +769,42 @@ def run(argv: list[str] | None = None) -> int:
             interactive_setup(args.config or Path("config.json"))
             return 0
         config = load_config(args.config, args)
+        if args.reset_batch and not config["batch_size"]:
+            raise SyncError("--reset-batch must be used together with --batch")
         if config["sample_size"]:
             LOG.info("Sample mode: processing at most %d item(s) per selected library; stale cleanup is disabled", config["sample_size"])
+        batch = None
+        if config["batch_size"]:
+            batch = load_batch_state(config, args.reset_batch)
+            LOG.info("Batch mode: processing the next %d movie(s) and show(s); stale cleanup is disabled", config["batch_size"])
         client = XtreamClient(config)
         user = client.authenticate()
         LOG.info("Connected (account status: %s)", user.get("status", "active"))
         entries: list[Entry] = []
         if config["sync_movies"]:
-            movies = collect_movies(client, config)
-            if not movies and not config["allow_empty_library"]:
+            movies = collect_movies(client, config, batch)
+            if not movies and not config["allow_empty_library"] and not batch:
                 raise SyncError("movie catalog is empty; refusing to replace the existing library (set allow_empty_library to true to permit this)")
             entries.extend(movies)
             LOG.info("Found %d movie(s)", len(movies))
         if config["sync_series"]:
-            episodes = collect_series(client, config)
-            if not episodes and not config["allow_empty_library"]:
+            episodes = collect_series(client, config, batch)
+            if not episodes and not config["allow_empty_library"] and not batch:
                 raise SyncError("series catalog has no episodes; refusing to replace the existing library (set allow_empty_library to true to permit this)")
             entries.extend(episodes)
             LOG.info("Found %d episode(s)", len(episodes))
         stats = apply_entries(entries, config, args.dry_run)
+        if batch and not args.dry_run:
+            new_movie_count = len(batch.new_movies)
+            new_series_count = len(batch.new_series)
+            save_batch_state(config, batch)
+            LOG.info("Batch progress: %d movie(s) and %d show(s) completed", len(batch.movies), len(batch.series))
+            if config["sync_movies"] and new_movie_count < config["batch_size"]:
+                LOG.info("Movie batching is complete; no additional unprocessed movies were found")
+            if config["sync_series"] and new_series_count < config["batch_size"]:
+                LOG.info("Series batching is complete; no additional unprocessed shows were found")
+        elif batch:
+            LOG.info("Dry run: batch progress was not saved")
         prefix = "Dry run complete" if args.dry_run else "Sync complete"
         LOG.info("%s: %d created, %d updated, %d unchanged, %d removed", prefix, stats.created, stats.updated, stats.unchanged, stats.removed)
         return 0
