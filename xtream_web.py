@@ -45,6 +45,8 @@ PASSWORD_ITERATIONS = 310_000
 MAX_BODY = 1_000_000
 SESSION_AGE = 12 * 60 * 60
 CONFIG_LOCK = threading.Lock()
+MANIFEST_LOCK = threading.Lock()
+MANIFEST_CACHE: dict[str, Any] = {"key": None, "value": None}
 
 
 def utc_now() -> str:
@@ -140,6 +142,70 @@ def read_status() -> dict[str, Any]:
     return {"state": "idle", "stage": "Ready", "current": 0, "total": 0, "detail": ""}
 
 
+def existing_library_discovery() -> dict[str, Any]:
+    """Count the managed library already on disk, cached until its manifest changes."""
+    try:
+        config = raw_config()
+        output = Path(str(config.get("output_dir", ""))).expanduser().resolve()
+        movies_directory = exporter.safe_relative_directory(config.get("movies_directory"), "Movies")
+        series_directory = exporter.safe_relative_directory(config.get("series_directory"), "TV Shows")
+        manifest = output / exporter.MANIFEST_NAME
+        stat = manifest.stat()
+        cache_key = (
+            str(manifest), stat.st_mtime_ns, stat.st_size,
+            movies_directory.casefold(), series_directory.casefold(),
+        )
+    except (OSError, exporter.SyncError, ValueError):
+        return {"movies": 0, "shows": 0, "episodes": 0, "recent_found": []}
+    with MANIFEST_LOCK:
+        if MANIFEST_CACHE["key"] == cache_key:
+            return dict(MANIFEST_CACHE["value"])
+        try:
+            files = exporter.read_manifest(output)
+        except exporter.SyncError:
+            return {"movies": 0, "shows": 0, "episodes": 0, "recent_found": []}
+        movie_root = tuple(part.casefold() for part in exporter.PurePosixPath(movies_directory).parts)
+        series_root = tuple(part.casefold() for part in exporter.PurePosixPath(series_directory).parts)
+        movie_count = 0
+        episode_count = 0
+        shows: set[tuple[str, ...]] = set()
+        samples: list[dict[str, str]] = []
+        sample_keys: set[tuple[str, str]] = set()
+        for relative in sorted(files):
+            path = exporter.PurePosixPath(relative)
+            folded = tuple(part.casefold() for part in path.parts)
+            if folded[:len(movie_root)] == movie_root:
+                movie_count += 1
+                title = path.parent.name if path.parent != exporter.PurePosixPath(".") else path.stem
+                sample_key = ("movie", title.casefold())
+                if len(samples) < 12 and sample_key not in sample_keys:
+                    samples.append({"kind": "movie", "title": title})
+                    sample_keys.add(sample_key)
+            elif folded[:len(series_root)] == series_root:
+                episode_count += 1
+                season_index = next(
+                    (index for index in range(len(path.parts) - 2, len(series_root) - 1, -1)
+                     if re.fullmatch(r"season\s+\d+", path.parts[index], re.IGNORECASE)),
+                    len(path.parts) - 2,
+                )
+                show_index = max(len(series_root), season_index - 1)
+                show_key = folded[:show_index + 1]
+                shows.add(show_key)
+                title = path.parts[show_index]
+                sample_key = ("show", title.casefold())
+                if len(samples) < 12 and sample_key not in sample_keys:
+                    samples.append({"kind": "show", "title": title})
+                    sample_keys.add(sample_key)
+        value = {
+            "movies": movie_count,
+            "shows": len(shows),
+            "episodes": episode_count,
+            "recent_found": samples,
+        }
+        MANIFEST_CACHE.update({"key": cache_key, "value": value})
+        return dict(value)
+
+
 def dashboard_status(include_logs: bool = False) -> dict[str, Any]:
     unit = current_unit()
     properties = unit_properties(unit)
@@ -150,6 +216,7 @@ def dashboard_status(include_logs: bool = False) -> dict[str, Any]:
     timer_enabled = run_command(["systemctl", "is-enabled", TIMER_UNIT]).returncode == 0
     timer_active = run_command(["systemctl", "is-active", TIMER_UNIT]).returncode == 0
     status = read_status()
+    status["existing_library"] = existing_library_discovery()
     if running:
         status["state"] = "running"
     result: dict[str, Any] = {
@@ -533,8 +600,8 @@ function toast(message,error=false){const e=$('#toast');e.textContent=message;e.
 async function boot(){try{const data=await api('/api/bootstrap');csrf=data.csrf;model=data.config;$('#version').textContent='v'+data.version;$('#login').classList.add('hidden');$('#app').classList.remove('hidden');renderConfig();renderStatus(data.status);clearInterval(statusTimer);statusTimer=setInterval(refreshStatus,2000)}catch(e){if(!String(e).includes('Login required'))toast(e.message,true)}}
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{const d=await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#loginPassword').value})});csrf=d.csrf;$('#loginPassword').value='';boot()}catch(x){$('#loginError').textContent=x.message}};
 $$('.nav button').forEach(b=>b.onclick=()=>{$$('.nav button').forEach(x=>x.classList.toggle('active',x===b));$$('.page').forEach(x=>x.classList.add('hidden'));$('#page-'+b.dataset.page).classList.remove('hidden');$('#pageTitle').textContent=b.textContent});
-function renderStatus(s){const p=s.progress||{},total=Number(p.total||0),current=Number(p.current||0),percent=total?Math.min(100,current/total*100):0,m=p.metrics||{},libraryReady=Number(m.library_movies||0)+Number(m.library_shows||0)+Number(m.library_episodes||0)>0;$('#stage').textContent=p.stage||'Ready';$('#detail').textContent=p.detail||(s.running?'Sync is running':'No sync is running');$('#progressBar').style.width=percent+'%';$('#progressText').textContent=total?`${current.toLocaleString()} of ${total.toLocaleString()} — ${percent.toFixed(1)}%`:(s.running?'Working…':p.state==='complete'?'Complete':'Ready');$('#statePill').textContent=s.running?'Syncing':p.state==='failed'?'Needs attention':'Ready';$('#statePill').classList.toggle('running',s.running);$('#stopSync').disabled=!s.running;$('#timerToggle').checked=s.timer_enabled;$('#timerMetric').textContent=s.timer_enabled?'Enabled':'Disabled';renderDiscovery(m,p.recent_found||[],libraryReady);$('#miniLogs').textContent=s.logs||'No activity yet.';$('#fullLogs').textContent=s.logs||'No activity yet.';$('#unitName').textContent=s.unit||'';for(const e of [$('#miniLogs'),$('#fullLogs')])e.scrollTop=e.scrollHeight}
-function renderDiscovery(m,recent,libraryReady){const movieCount=libraryReady?Number(m.library_movies||0):Number(m.source_movies||0),showCount=libraryReady?Number(m.library_shows||0):Number(m.source_shows||0),episodeCount=libraryReady?Number(m.library_episodes||0):Number(m.source_episodes||0);$('#moviesFound').textContent=movieCount.toLocaleString();$('#showsFound').textContent=showCount.toLocaleString();$('#episodesFound').textContent=episodeCount.toLocaleString();$('#moviesFoundNote').textContent=libraryReady?`${Number(m.source_movies||0).toLocaleString()} provider matches; duplicates merged`:'Selected across providers';$('#showsFoundNote').textContent=libraryReady?`${Number(m.source_shows||0).toLocaleString()} provider matches; duplicates merged`:'Selected shows read so far';$('#episodesFoundNote').textContent=libraryReady?`${Number(m.duplicates_merged||0).toLocaleString()} duplicate source items merged`:'Playable episodes read so far';const root=$('#recentFound');root.innerHTML='';if(!recent.length){const empty=document.createElement('span');empty.className='muted';empty.textContent='Titles will appear here during a sync.';root.appendChild(empty);return}recent.slice(0,12).forEach(item=>{const row=document.createElement('div');row.className='found-item';const badge=document.createElement('span');badge.className='found-badge';badge.textContent=item.kind==='movie'?'MOVIE':'SHOW';const title=document.createElement('span');title.className='found-title';title.textContent=item.title||'Unknown';row.append(badge,title);root.appendChild(row)})}
+function renderStatus(s){const p=s.progress||{},total=Number(p.total||0),current=Number(p.current||0),percent=total?Math.min(100,current/total*100):0,m=p.metrics||{},existing=p.existing_library||{},libraryReady=Number(m.library_movies||0)+Number(m.library_shows||0)+Number(m.library_episodes||0)>0,discoveryActive=s.running&&(Number(m.source_movies||0)+Number(m.source_shows||0)+Number(m.source_episodes||0)>0);$('#stage').textContent=p.stage||'Ready';$('#detail').textContent=p.detail||(s.running?'Sync is running':'No sync is running');$('#progressBar').style.width=percent+'%';$('#progressText').textContent=total?`${current.toLocaleString()} of ${total.toLocaleString()} — ${percent.toFixed(1)}%`:(s.running?'Working…':p.state==='complete'?'Complete':'Ready');$('#statePill').textContent=s.running?'Syncing':p.state==='failed'?'Needs attention':'Ready';$('#statePill').classList.toggle('running',s.running);$('#stopSync').disabled=!s.running;$('#timerToggle').checked=s.timer_enabled;$('#timerMetric').textContent=s.timer_enabled?'Enabled':'Disabled';renderDiscovery(m,p.recent_found||[],existing,libraryReady,discoveryActive);$('#miniLogs').textContent=s.logs||'No activity yet.';$('#fullLogs').textContent=s.logs||'No activity yet.';$('#unitName').textContent=s.unit||'';for(const e of [$('#miniLogs'),$('#fullLogs')])e.scrollTop=e.scrollHeight}
+function renderDiscovery(m,recent,existing,libraryReady,discoveryActive){const useExisting=!libraryReady&&!discoveryActive,movieCount=useExisting?Number(existing.movies||0):(libraryReady?Number(m.library_movies||0):Number(m.source_movies||0)),showCount=useExisting?Number(existing.shows||0):(libraryReady?Number(m.library_shows||0):Number(m.source_shows||0)),episodeCount=useExisting?Number(existing.episodes||0):(libraryReady?Number(m.library_episodes||0):Number(m.source_episodes||0));$('#moviesFound').textContent=movieCount.toLocaleString();$('#showsFound').textContent=showCount.toLocaleString();$('#episodesFound').textContent=episodeCount.toLocaleString();if(useExisting){$('#moviesFoundNote').textContent='Already in the managed library';$('#showsFoundNote').textContent='Already in the managed library';$('#episodesFoundNote').textContent='Already in the managed library'}else{$('#moviesFoundNote').textContent=libraryReady?`${Number(m.source_movies||0).toLocaleString()} provider matches; duplicates merged`:'Selected across providers';$('#showsFoundNote').textContent=libraryReady?`${Number(m.source_shows||0).toLocaleString()} provider matches; duplicates merged`:'Selected shows read so far';$('#episodesFoundNote').textContent=libraryReady?`${Number(m.duplicates_merged||0).toLocaleString()} duplicate source items merged`:'Playable episodes read so far'}const shown=recent.length?recent:(existing.recent_found||[]),root=$('#recentFound');root.innerHTML='';if(!shown.length){const empty=document.createElement('span');empty.className='muted';empty.textContent='No managed titles are recorded yet.';root.appendChild(empty);return}shown.slice(0,12).forEach(item=>{const row=document.createElement('div');row.className='found-item';const badge=document.createElement('span');badge.className='found-badge';badge.textContent=item.kind==='movie'?'MOVIE':'SHOW';const title=document.createElement('span');title.className='found-title';title.textContent=item.title||'Unknown';row.append(badge,title);root.appendChild(row)})}
 async function refreshStatus(){try{renderStatus(await api('/api/status'))}catch(e){if(!String(e).includes('Login required'))console.warn(e)}}
 function renderConfig(){$$('[data-setting]').forEach(e=>{const value=model.settings[e.dataset.setting];if(e.type==='checkbox')e.checked=!!value;else e.value=value??''});renderProviders()}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
