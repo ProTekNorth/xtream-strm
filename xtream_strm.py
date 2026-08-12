@@ -26,10 +26,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
+PENDING_STATE_NAME = ".xtream-strm-pending.json"
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
 QUALITY_TOKEN = r"(?:4k|(?:2160|1080|720|576|480)p|uhd|fhd|hd|sd|hdr10\+?|hdr|dolby[ ._-]*vision|dv|hevc|x26[45]|h[ .]?26[45]|multi(?:[ ._-]*(?:audio|sub(?:title)?s?))?)"
@@ -1111,6 +1112,68 @@ def save_batch_state(config: dict[str, Any], state: BatchState) -> None:
     atomic_write(path, json.dumps(payload, indent=2) + "\n", config["file_mode"], config["directory_mode"])
 
 
+def pending_signature(config: dict[str, Any]) -> str:
+    fields = (
+        "server_url", "username", "sync_movies", "sync_series", "movies_directory", "series_directory",
+        "category_directories", "normalize_names", "add_provider_ids", "auto_strip_name_tags",
+        "strip_name_prefixes", "preserve_name_prefixes", "include_categories", "exclude_categories",
+        "movie_category_ids", "series_category_ids", "clean_stale",
+    )
+    payload = {field: config[field] for field in fields}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def save_pending_entries(config: dict[str, Any], entries: list[Entry]) -> None:
+    payload = {
+        "version": 1,
+        "signature": pending_signature(config),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "entries": [
+            {"path": entry.relative_path.as_posix(), "url": entry.stream_url}
+            for entry in entries
+        ],
+    }
+    path: Path = config["output_dir"] / PENDING_STATE_NAME
+    LOG.info("Saving a write checkpoint for %d STRM file(s)", len(entries))
+    atomic_write(path, json.dumps(payload, separators=(",", ":")) + "\n", config["file_mode"], config["directory_mode"])
+
+
+def load_pending_entries(config: dict[str, Any]) -> list[Entry] | None:
+    path: Path = config["output_dir"] / PENDING_STATE_NAME
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != 1 or payload.get("signature") != pending_signature(config):
+            LOG.warning("Ignoring an old write checkpoint because the provider or folder settings changed")
+            return None
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, list):
+            raise ValueError("entries is not a list")
+        entries: list[Entry] = []
+        for item in raw_entries:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("url"), str):
+                raise ValueError("invalid checkpoint entry")
+            relative = PurePosixPath(item["path"])
+            if relative.is_absolute() or ".." in relative.parts or relative.suffix.casefold() != ".strm":
+                raise ValueError("unsafe checkpoint path")
+            entries.append(Entry(Path(*relative.parts), item["url"]))
+        LOG.info("Resuming %d STRM file(s) from the saved checkpoint; provider catalogs will not be reread", len(entries))
+        return entries
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise SyncError(f"could not read write checkpoint {path}: {exc}") from exc
+
+
+def clear_pending_entries(config: dict[str, Any]) -> None:
+    path: Path = config["output_dir"] / PENDING_STATE_NAME
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise SyncError(f"could not remove completed write checkpoint {path}: {exc}") from exc
+
+
 def safe_manifest_target(output: Path, relative: str) -> Path | None:
     posix = PurePosixPath(relative)
     if posix.is_absolute() or ".." in posix.parts or posix.suffix.lower() != ".strm":
@@ -1290,20 +1353,27 @@ def run(argv: list[str] | None = None) -> int:
             LOG.info("Connected to Jellyfin; continuous batching is enabled")
 
         while True:
-            entries: list[Entry] = []
-            if config["sync_movies"]:
-                movies = collect_movies(client, config, batch)
-                if not movies and not config["allow_empty_library"] and not batch:
-                    raise SyncError("movie catalog is empty; refusing to replace the existing library (set allow_empty_library to true to permit this)")
-                entries.extend(movies)
-                LOG.info("Found %d movie(s)", len(movies))
-            if config["sync_series"]:
-                episodes = collect_series(client, config, batch)
-                if not episodes and not config["allow_empty_library"] and not batch:
-                    raise SyncError("series catalog has no episodes; refusing to replace the existing library (set allow_empty_library to true to permit this)")
-                entries.extend(episodes)
-                LOG.info("Found %d episode(s)", len(episodes))
+            checkpoint_enabled = not batch and not config["sample_size"] and not args.dry_run
+            saved_entries = load_pending_entries(config) if checkpoint_enabled else None
+            entries: list[Entry] = saved_entries if saved_entries is not None else []
+            if saved_entries is None:
+                if config["sync_movies"]:
+                    movies = collect_movies(client, config, batch)
+                    if not movies and not config["allow_empty_library"] and not batch:
+                        raise SyncError("movie catalog is empty; refusing to replace the existing library (set allow_empty_library to true to permit this)")
+                    entries.extend(movies)
+                    LOG.info("Found %d movie(s)", len(movies))
+                if config["sync_series"]:
+                    episodes = collect_series(client, config, batch)
+                    if not episodes and not config["allow_empty_library"] and not batch:
+                        raise SyncError("series catalog has no episodes; refusing to replace the existing library (set allow_empty_library to true to permit this)")
+                    entries.extend(episodes)
+                    LOG.info("Found %d episode(s)", len(episodes))
+                if checkpoint_enabled:
+                    save_pending_entries(config, entries)
             stats = apply_entries(entries, config, args.dry_run)
+            if checkpoint_enabled:
+                clear_pending_entries(config)
             new_movie_count = len(batch.new_movies) if batch else 0
             new_series_count = len(batch.new_series) if batch else 0
             if batch and not args.dry_run:
