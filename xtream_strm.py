@@ -34,6 +34,8 @@ LEADING_QUALITY = re.compile(rf"^\s*{QUALITY_TOKEN}\s*(?:[-|•:]\s*)", re.IGNOR
 TRAILING_QUALITY = re.compile(rf"\s*(?:[-|•]\s*){QUALITY_TOKEN}\s*$", re.IGNORECASE)
 TRAILING_BRACKETED_YEAR = re.compile(r"\s*[\[({](19\d{2}|20\d{2})[\])}]\s*$")
 TRAILING_SEPARATED_YEAR = re.compile(r"\s*(?:[-|]\s*|\s+)(19\d{2}|20\d{2})\s*$")
+LEADING_PROVIDER_TAG = re.compile(r"^(?P<tag>[A-Z][A-Z0-9]{1,5})\s*(?:-\s+|\|\s*|:\s+)")
+LEADING_BRACKETED_TAG = re.compile(r"^[\[({](?P<tag>[A-Z][A-Z0-9]{1,5})[\])}]\s*(?:[-|:]\s*)?")
 
 
 class SyncError(RuntimeError):
@@ -65,7 +67,9 @@ DEFAULTS: dict[str, Any] = {
     "series_directory": "TV Shows",
     "category_directories": True,
     "normalize_names": True,
+    "auto_strip_name_tags": True,
     "strip_name_prefixes": ["US:", "UK:", "|EN|"],
+    "preserve_name_prefixes": ["IT"],
     "include_categories": [],
     "exclude_categories": [],
     "clean_stale": True,
@@ -242,14 +246,14 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     if args.sample_size is not None:
         config["sample_size"] = args.sample_size
 
-    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "clean_stale", "allow_empty_library", "verify_tls"):
+    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "auto_strip_name_tags", "clean_stale", "allow_empty_library", "verify_tls"):
         config[field] = as_bool(config[field], field)
     if not config["sync_movies"] and not config["sync_series"]:
         raise SyncError("at least one of sync_movies or sync_series must be enabled")
     for field in ("server_url", "username", "password", "output_dir"):
         if not str(config[field]).strip():
             raise SyncError(f"missing required setting: {field}")
-    for field in ("include_categories", "exclude_categories", "strip_name_prefixes"):
+    for field in ("include_categories", "exclude_categories", "strip_name_prefixes", "preserve_name_prefixes"):
         if not isinstance(config[field], list) or not all(isinstance(item, str) for item in config[field]):
             raise SyncError(f"{field} must be a list of strings")
     try:
@@ -375,6 +379,19 @@ def normalize_media_name(value: Any, config: dict[str, Any], fallback: str) -> s
                     name = name[len(prefix):].lstrip(" |:-")
                     removed = True
                     break
+        if config["auto_strip_name_tags"]:
+            preserved = {prefix.casefold().strip(" [](){}|:-") for prefix in config["preserve_name_prefixes"]}
+            removed = True
+            while removed and name:
+                removed = False
+                for pattern in (LEADING_PROVIDER_TAG, LEADING_BRACKETED_TAG):
+                    match = pattern.match(name)
+                    if match and match.group("tag").casefold() not in preserved:
+                        remainder = name[match.end():].lstrip(" |:-")
+                        if re.search(r"[A-Za-z0-9]", remainder):
+                            name = remainder
+                            removed = True
+                            break
         name = re.sub(r"\s+", " ", name).strip(" -|•")
     return safe_name(name, fallback)
 
