@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -85,6 +85,8 @@ DEFAULTS: dict[str, Any] = {
     "preserve_name_prefixes": ["IT"],
     "include_categories": [],
     "exclude_categories": [],
+    "movie_category_ids": [],
+    "series_category_ids": [],
     "clean_stale": True,
     "allow_empty_library": False,
     "sample_size": 0,
@@ -166,6 +168,51 @@ def prompt(label: str, default: str | None = None, secret: bool = False) -> str:
     return value or (default or "")
 
 
+def choose_category_ids(label: str, categories: dict[str, str], existing: Any = None) -> list[str]:
+    if not categories:
+        print(f"No {label.lower()} groups were returned by the provider.")
+        return []
+    items = list(categories.items())
+    selected_before = {str(value) for value in existing} if isinstance(existing, list) else set()
+    default_numbers = [str(index) for index, (category_id, _) in enumerate(items, start=1) if category_id in selected_before]
+    default = ",".join(default_numbers) if selected_before and default_numbers else "all"
+
+    print(f"\nAvailable {label.lower()} groups:")
+    for index, (_, name) in enumerate(items, start=1):
+        marker = " *" if str(index) in default_numbers else ""
+        print(f"  {index:>3}) {name}{marker}")
+    print("Enter all for every group, individual numbers such as 1,4,7, or ranges such as 2-6.")
+    answer = prompt(f"{label} groups to import", default).casefold()
+    if answer in {"all", "*"}:
+        return []
+
+    positions: list[int] = []
+    for part in (value.strip() for value in answer.split(",")):
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-", 1)
+            if len(bounds) != 2 or not all(value.isdigit() for value in bounds):
+                raise SyncError(f"invalid {label.lower()} group selection: {part}")
+            start, end = (int(value) for value in bounds)
+            if start > end:
+                raise SyncError(f"invalid descending group range: {part}")
+            positions.extend(range(start, end + 1))
+        elif part.isdigit():
+            positions.append(int(part))
+        else:
+            raise SyncError(f"invalid {label.lower()} group selection: {part}")
+    if not positions or any(position < 1 or position > len(items) for position in positions):
+        raise SyncError(f"{label.lower()} group selection must use numbers from 1 to {len(items)}")
+
+    result: list[str] = []
+    for position in positions:
+        category_id = items[position - 1][0]
+        if category_id not in result:
+            result.append(category_id)
+    return result
+
+
 def interactive_setup(path: Path) -> None:
     if not sys.stdin.isatty():
         raise SyncError("guided setup needs an interactive terminal")
@@ -188,7 +235,12 @@ def interactive_setup(path: Path) -> None:
     password_default = str(existing.get("password") or url_password or "")
     password = prompt("Password" + (" (press Enter to use the detected or saved value)" if password_default else ""), password_default, secret=True)
     output_dir = str(Path(prompt("Library directory", str(existing.get("output_dir", "/srv/media/xtream")))).expanduser().resolve())
-    content = prompt("Content to export: both, movies, or series", "both").lower()
+    existing_content = "both"
+    if existing.get("sync_movies") is True and existing.get("sync_series") is False:
+        existing_content = "movies"
+    elif existing.get("sync_movies") is False and existing.get("sync_series") is True:
+        existing_content = "series"
+    content = prompt("Content to export: both, movies, or series", existing_content).lower()
     if content not in {"both", "movies", "series"}:
         raise SyncError("content selection must be both, movies, or series")
     if not username or not password:
@@ -228,8 +280,20 @@ def interactive_setup(path: Path) -> None:
     probe["request_timeout"] = float(config["request_timeout"])
     probe["retries"] = int(config["retries"])
     probe["verify_tls"] = as_bool(config["verify_tls"], "verify_tls")
-    user = XtreamClient(probe).authenticate()
+    client = XtreamClient(probe)
+    user = client.authenticate()
     print(f"Login accepted (status: {user.get('status', 'active')}).")
+
+    if config["sync_movies"]:
+        movie_categories = category_map(client.api("get_vod_categories"))
+        config["movie_category_ids"] = choose_category_ids(
+            "Movie", movie_categories, existing.get("movie_category_ids", [])
+        )
+    if config["sync_series"]:
+        series_categories = category_map(client.api("get_series_categories"))
+        config["series_category_ids"] = choose_category_ids(
+            "TV show", series_categories, existing.get("series_category_ids", [])
+        )
 
     serializable = {key: config[key] for key in DEFAULTS}
     atomic_write(path.resolve(), json.dumps(serializable, indent=2) + "\n", 0o600, 0o750)
@@ -290,7 +354,7 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     for field in ("server_url", "username", "password", "output_dir"):
         if not str(config[field]).strip():
             raise SyncError(f"missing required setting: {field}")
-    for field in ("include_categories", "exclude_categories", "strip_name_prefixes", "preserve_name_prefixes"):
+    for field in ("include_categories", "exclude_categories", "movie_category_ids", "series_category_ids", "strip_name_prefixes", "preserve_name_prefixes"):
         if not isinstance(config[field], list) or not all(isinstance(item, str) for item in config[field]):
             raise SyncError(f"{field} must be a list of strings")
     try:
@@ -499,11 +563,17 @@ def category_map(payload: Any) -> dict[str, str]:
     return result
 
 
-def category_allowed(name: str, config: dict[str, Any]) -> bool:
+def category_allowed(category_id: Any, name: str, kind: str, config: dict[str, Any]) -> bool:
+    selection_field = "movie_category_ids" if kind == "movie" else "series_category_ids"
+    selected_ids = {str(value) for value in config[selection_field]}
     normalized = name.casefold()
     include = {item.casefold() for item in config["include_categories"]}
     exclude = {item.casefold() for item in config["exclude_categories"]}
-    return (not include or normalized in include) and normalized not in exclude
+    return (
+        (not selected_ids or str(category_id) in selected_ids)
+        and (not include or normalized in include)
+        and normalized not in exclude
+    )
 
 
 def with_category(root: str, category: str, config: dict[str, Any]) -> Path:
@@ -644,7 +714,7 @@ def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         if batch and stream_id in batch.movies:
             continue
         category = categories.get(str(item.get("category_id")), "Uncategorized")
-        if not category_allowed(category, config):
+        if not category_allowed(item.get("category_id"), category, "movie", config):
             continue
         display = canonical_media_title(item.get("name"), item, config, f"Movie {item['stream_id']}")
         folder = with_category(config["movies_directory"], category, config) / display
@@ -698,7 +768,7 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         if batch and series_id in batch.series:
             continue
         category = categories.get(str(show.get("category_id")), "Uncategorized")
-        if not category_allowed(category, config):
+        if not category_allowed(show.get("category_id"), category, "series", config):
             continue
         detail = client.api("get_series_info", series_id=show["series_id"])
         info = detail.get("info", {}) if isinstance(detail, dict) else {}
