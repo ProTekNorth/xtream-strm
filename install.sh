@@ -154,14 +154,36 @@ fi
 
 echo ""
 echo "The sample is ready in: $OUTPUT_DIR"
-printf "Continue with the complete library and enable six-hour refreshes? [Y/n]: "
-read -r continue_answer
-case "$continue_answer" in
-  n|N|no|NO)
-    echo "Stopped after the sample. No scheduled full sync was enabled."
-    echo "When ready, run: sudo systemctl enable --now xtream-strm.timer"
-    echo "Then run: sudo systemctl start xtream-strm.service"
+echo "Choose how to create the initial library:"
+echo "  1) Gradual batches (recommended for large libraries)"
+echo "  2) Complete library now"
+echo "  3) Stop after the sample"
+printf "Selection [1]: "
+read -r import_choice
+case "$import_choice" in
+  3)
+    echo "Stopped after the sample. No scheduled sync was enabled."
     exit 0
+    ;;
+  2) ;;
+  1|"")
+    echo "Starting the first gradual batch (up to 100 movies and 100 shows)..."
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u xtream-strm -- "$INSTALL_DIR/xtream_strm.py" --config "$CONFIG_FILE" --batch 100
+    else
+      su -s /bin/sh xtream-strm -c "'$INSTALL_DIR/xtream_strm.py' --config '$CONFIG_FILE' --batch 100"
+    fi
+    echo ""
+    echo "The first batch is ready. Let Jellyfin scan it, then repeat:"
+    echo "  sudo -u xtream-strm $INSTALL_DIR/xtream_strm.py --config $CONFIG_FILE --batch 100"
+    echo "When batching is complete, enable regular six-hour refreshes:"
+    echo "  sudo systemctl enable --now xtream-strm.timer"
+    echo "  sudo systemctl start xtream-strm.service"
+    exit 0
+    ;;
+  *)
+    echo "Invalid selection." >&2
+    exit 1
     ;;
 esac
 
