@@ -28,7 +28,7 @@ cd xtream-strm
 sudo sh install.sh
 ```
 
-The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. It checks the login and creates a five-item sample first. You can then choose a gradual initial import, a complete import, or stop after the sample. Gradual import is the recommended choice for very large Jellyfin libraries.
+The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. After checking the login, it displays the provider's numbered movie and TV groups so you can import all groups or select individual numbers and ranges. It then creates a five-item sample. You can choose a gradual initial import, a complete import, or stop after the sample. Gradual import is recommended for very large Jellyfin libraries.
 
 If Python 3 or curl is missing, the installer installs it automatically using `apt`, `dnf`, `yum`, `zypper`, `apk`, or `pacman`. Python 3.10 or newer is required.
 
@@ -151,6 +151,7 @@ Command-line connection settings override environment variables, which override 
 
 - `include_categories`: exact, case-insensitive category names to include; empty means all.
 - `exclude_categories`: exact, case-insensitive names to skip.
+- `movie_category_ids` and `series_category_ids`: provider group IDs selected by guided setup. Empty means every group of that media type.
 - `normalize_names`: produce consistent media-server names by cleaning Unicode, HTML entities, whitespace, quality tags, release years, episode numbers, and season numbers.
 - `add_provider_ids`: append a Jellyfin-compatible TMDB or IMDb ID when that ID is already supplied by the Xtream provider. The exporter does not scrape metadata sites or make extra per-movie metadata requests.
 - `auto_strip_name_tags`: remove short uppercase provider tags before a separator, such as `PS -`, `SOM -`, `VIP:`, or `[ABC]`.
