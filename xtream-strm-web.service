@@ -1,0 +1,29 @@
+[Unit]
+Description=Xtream STRM web dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/xtream-strm/xtream_web.py --config /etc/xtream-strm/config.json --web-config /etc/xtream-strm/web.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/etc/xtream-strm /var/lib/xtream-strm
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

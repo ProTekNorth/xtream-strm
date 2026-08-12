@@ -5,6 +5,9 @@ PROGRAM=/opt/xtream-strm/xtream_strm.py
 CONFIG=/etc/xtream-strm/config.json
 SERVICE=xtream-strm.service
 TIMER=xtream-strm.timer
+WEB_SERVICE=xtream-strm-web.service
+WEB_PROGRAM=/opt/xtream-strm/xtream_web.py
+WEB_CONFIG=/etc/xtream-strm/web.json
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Opening Xtream STRM requires administrator access."
@@ -23,7 +26,9 @@ pause_menu() {
 }
 
 service_is_running() {
-  systemctl is-active --quiet "$SERVICE"
+  systemctl is-active --quiet "$SERVICE" && return 0
+  systemctl list-units --type=service --state=active --no-legend \
+    'xtream-strm-batch-*.service' 'xtream-strm-sample-*.service' 2>/dev/null | grep -q .
 }
 
 run_as_service_user() {
@@ -116,6 +121,28 @@ scheduled_syncs() {
   fi
 }
 
+dashboard_tools() {
+  dashboard_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  dashboard_ip=${dashboard_ip:-127.0.0.1}
+  echo "Dashboard address: http://$dashboard_ip:8787"
+  if systemctl is-active --quiet "$WEB_SERVICE"; then
+    echo "Dashboard service: running"
+  else
+    echo "Dashboard service: stopped"
+  fi
+  printf "Reset the dashboard password? [y/N]: "
+  read -r reset_answer
+  case "$reset_answer" in
+    y|Y|yes|YES)
+      new_password=$("$WEB_PROGRAM" --web-config "$WEB_CONFIG" --reset-password)
+      systemctl restart "$WEB_SERVICE"
+      echo "New dashboard password: $new_password"
+      echo "Save it now; it will not be shown again."
+      ;;
+    *) ;;
+  esac
+}
+
 while true; do
   echo ""
   echo "Xtream STRM control menu"
@@ -127,7 +154,8 @@ while true; do
   echo "  5) Check background sync status"
   echo "  6) Reconfigure settings"
   echo "  7) Enable or disable scheduled syncs"
-  echo "  8) Exit"
+  echo "  8) Show dashboard or reset its password"
+  echo "  9) Exit"
   printf "Selection [1]: "
   read -r choice
 
@@ -139,7 +167,8 @@ while true; do
     5) show_status; pause_menu ;;
     6) reconfigure; pause_menu ;;
     7) scheduled_syncs; pause_menu ;;
-    8) exit 0 ;;
-    *) echo "Choose a number from 1 through 8." ;;
+    8) dashboard_tools; pause_menu ;;
+    9) exit 0 ;;
+    *) echo "Choose a number from 1 through 9." ;;
   esac
 done

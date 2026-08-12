@@ -14,6 +14,7 @@ import re
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -26,7 +27,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -85,11 +86,16 @@ class ProgressBar:
         self.enabled = sys.stderr.isatty() if enabled is None else enabled
         self._last_length = 0
         self._pulse = 0
+        self._last_status_write = 0.0
 
     def update(self, current: int | None = None, detail: str = "") -> None:
         if current is not None:
             self.current = max(0, int(current))
         self.detail = safe_name(detail, "", 50) if detail else ""
+        now = time.monotonic()
+        if now - self._last_status_write >= 0.25 or (self.total and self.current >= self.total):
+            write_runtime_status("running", self.label, self.current, self.total, self.detail)
+            self._last_status_write = now
         if not self.enabled:
             return
         if self.total:
@@ -114,6 +120,7 @@ class ProgressBar:
         if detail:
             self.detail = detail
         self.update(self.current, self.detail)
+        write_runtime_status("running", self.label, self.current, self.total, self.detail, force=True)
         if self.enabled:
             sys.stderr.write("\n")
             sys.stderr.flush()
@@ -124,6 +131,43 @@ class ProgressBar:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.finish("failed" if exc_type else self.detail)
+
+
+_STATUS_LOCK = threading.Lock()
+
+
+def write_runtime_status(
+    state: str,
+    stage: str,
+    current: int = 0,
+    total: int = 0,
+    detail: str = "",
+    *,
+    force: bool = False,
+) -> None:
+    """Publish a small status snapshot for the optional local web dashboard."""
+    target = os.getenv("XTREAM_STATUS_FILE", "").strip()
+    if not target:
+        return
+    payload = {
+        "state": state,
+        "stage": stage,
+        "current": max(0, int(current)),
+        "total": max(0, int(total)),
+        "detail": str(detail or "")[:160],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = Path(target)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with _STATUS_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(temporary, path)
+    except OSError:
+        # The dashboard is optional and must never make a library sync fail.
+        if force:
+            LOG.debug("Could not update dashboard status file", exc_info=True)
 
 
 def threaded_map(function: Any, items: Iterable[Any], workers: int) -> Iterable[Any]:
@@ -1575,6 +1619,7 @@ def run(argv: list[str] | None = None) -> int:
             interactive_setup(args.config or Path("config.json"))
             return 0
         config = load_config(args.config, args)
+        write_runtime_status("running", "Starting sync", 0, 0, "Loading configuration", force=True)
         if args.reset_batch and not config["batch_size"]:
             raise SyncError("--reset-batch must be used together with --batch")
         if args.continuous and not config["batch_size"]:
@@ -1662,12 +1707,15 @@ def run(argv: list[str] | None = None) -> int:
                 jellyfin.refresh_and_wait()
             else:
                 LOG.info("The batch contained no playable episodes; continuing to the next batch")
+        write_runtime_status("complete", "Sync complete", 1, 1, "Library is up to date", force=True)
         return 0
     except (SyncError, OSError) as exc:
         LOG.error("%s", exc)
+        write_runtime_status("failed", "Sync failed", 0, 0, str(exc), force=True)
         return 1
     except KeyboardInterrupt:
         LOG.error("interrupted")
+        write_runtime_status("stopped", "Sync stopped", 0, 0, "Interrupted", force=True)
         return 130
 
 

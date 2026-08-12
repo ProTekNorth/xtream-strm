@@ -1,6 +1,6 @@
 # Xtream STRM exporter
 
-A dependency-free Linux command-line tool that signs in to one or more Xtream Codes-compatible providers, merges their movie and series catalogs, and creates one deduplicated Jellyfin/Kodi-compatible `.strm` library.
+A dependency-free Linux tool with an authenticated web dashboard and terminal menu. It signs in to one or more Xtream Codes-compatible providers, merges their movie and series catalogs, and creates one deduplicated Jellyfin/Kodi-compatible `.strm` library.
 
 Only use it with a provider and content library you are authorized to access. A `.strm` file contains a playable provider URL, so it necessarily contains the Xtream username and password. Keep the output directory private and do not publish, sync, or share it.
 
@@ -30,6 +30,35 @@ sudo sh install.sh
 
 The installer asks for the first provider address (a full M3U/API link is also accepted), username, password, and whether another provider should be added. Each provider has its own numbered movie and TV group selection. It then asks for the library location and whether to export movies, series, or both, and creates a five-item sample. You can choose a gradual initial import, a complete import, or stop after the sample. Gradual import is recommended for very large Jellyfin libraries. Interactive runs show progress bars while provider catalogs are downloaded, movies and shows are scanned, STRM files are written, stale files are cleaned, and Jellyfin scans are running.
 
+At the end, the installer prints a dashboard address such as `http://192.168.0.157:8787` and a randomly generated password. Save that password when it is shown. The web dashboard is installed as a service and starts automatically after a reboot.
+
+## Web dashboard
+
+Open the dashboard address from a browser on the same private network. It provides:
+
+- live sync stage, percentage, current title, and service logs;
+- complete, resumable batch, and small sample syncs that continue in the background if the browser is closed;
+- safe stop controls that preserve the exporter's existing checkpoints;
+- provider add/remove/reordering and per-provider movie and TV group selection;
+- separate movie and TV folders, naming, Jellyfin, and worker settings;
+- scheduled six-hour sync controls.
+
+The dashboard password is stored as a salted PBKDF2 hash. Provider passwords and the Jellyfin API key are never returned to the browser; blank secret fields keep their existing value. Configuration changes are blocked while a sync is active.
+
+The dashboard uses ordinary HTTP so it is intended for a trusted home LAN or a VPN. Do **not** forward port `8787` directly to the internet. For remote public access, place it behind a trusted HTTPS reverse proxy with additional authentication.
+
+To display its address or reset a forgotten password, open the terminal menu and choose option 8:
+
+```bash
+sudo xtream-strm
+```
+
+You can also check the dashboard service directly:
+
+```bash
+sudo systemctl status xtream-strm-web.service
+```
+
 ## Multiple providers and duplicate merging
 
 Providers are ordered by priority. When two providers contain the same movie or episode, the first provider supplies the STRM URL. Later providers fill movies and episodes missing from higher-priority sources. Shows are merged at the season/episode level and placed in the highest-priority matching show folder.
@@ -46,7 +75,7 @@ After installation, open the interactive control menu with one command:
 sudo xtream-strm
 ```
 
-The menu can run a complete sync or resumable batch in the terminal with live progress, start a complete sync in the background, watch or check that background job, reconfigure selected settings, and enable or disable scheduled six-hour syncs. It prevents a foreground sync from starting while the background service is already active.
+The menu remains available as a fallback. It can run a complete sync or resumable batch in the terminal with live progress, start a complete sync in the background, watch or check that background job, reconfigure selected settings, enable or disable scheduled six-hour syncs, and reset the web password. It prevents a foreground sync from starting while a background or dashboard job is already active.
 
 The exporter uses multiple worker threads to load TV-show details and create STRM files concurrently. The default is eight workers. Change it through **Reconfigure settings → Sync behavior** if a provider requires fewer connections or the storage can handle more. One worker disables concurrency; the supported range is 1–32. Sample mode intentionally reads shows sequentially so a small test does not request the entire TV catalog.
 
@@ -155,7 +184,9 @@ sudo chown xtream-strm:xtream-strm /etc/xtream-strm/config.json
 sudo chown -R xtream-strm:media /srv/media/xtream
 sudo install -m 0644 xtream-strm.service /etc/systemd/system/
 sudo install -m 0644 xtream-strm.timer /etc/systemd/system/
+sudo install -m 0644 xtream-strm-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now xtream-strm-web.service
 sudo systemctl enable --now xtream-strm.timer
 sudo systemctl start xtream-strm.service
 sudo journalctl -u xtream-strm.service

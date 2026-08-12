@@ -75,6 +75,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 INSTALL_DIR=/opt/xtream-strm
 CONFIG_DIR=/etc/xtream-strm
 CONFIG_FILE=$CONFIG_DIR/config.json
+WEB_CONFIG_FILE=$CONFIG_DIR/web.json
+STATE_DIR=/var/lib/xtream-strm
 
 if ! getent group media >/dev/null 2>&1; then
   groupadd --system media
@@ -87,7 +89,9 @@ fi
 install -d -m 0755 "$INSTALL_DIR"
 install -d -m 0755 /usr/local/bin
 install -d -o root -g media -m 0750 "$CONFIG_DIR"
+install -d -o xtream-strm -g media -m 0750 "$STATE_DIR"
 install -m 0755 "$SCRIPT_DIR/xtream_strm.py" "$INSTALL_DIR/xtream_strm.py"
+install -m 0755 "$SCRIPT_DIR/xtream_web.py" "$INSTALL_DIR/xtream_web.py"
 install -m 0755 "$SCRIPT_DIR/xtream-strm-menu" /usr/local/bin/xtream-strm
 
 EXISTING_CONFIG=no
@@ -108,6 +112,13 @@ fi
 
 chown xtream-strm:root "$CONFIG_FILE"
 chmod 0600 "$CONFIG_FILE"
+
+DASHBOARD_PASSWORD=""
+if [ ! -f "$WEB_CONFIG_FILE" ]; then
+  DASHBOARD_PASSWORD=$("$INSTALL_DIR/xtream_web.py" --web-config "$WEB_CONFIG_FILE" --init-password)
+fi
+chown root:root "$WEB_CONFIG_FILE"
+chmod 0600 "$WEB_CONFIG_FILE"
 
 OUTPUT_DIR=$(python3 -c 'import json, os, sys; print(os.path.abspath(os.path.expanduser(json.load(open(sys.argv[1], encoding="utf-8"))["output_dir"])))' "$CONFIG_FILE")
 case "$OUTPUT_DIR" in
@@ -157,18 +168,30 @@ elif ! su -s /bin/sh xtream-strm -c "test -w '$OUTPUT_DIR'"; then
 fi
 install -m 0644 "$SCRIPT_DIR/xtream-strm.service" /etc/systemd/system/xtream-strm.service
 install -m 0644 "$SCRIPT_DIR/xtream-strm.timer" /etc/systemd/system/xtream-strm.timer
+install -m 0644 "$SCRIPT_DIR/xtream-strm-web.service" /etc/systemd/system/xtream-strm-web.service
 
 if id jellyfin >/dev/null 2>&1; then
   usermod -aG media jellyfin
 fi
 
 systemctl daemon-reload
+systemctl enable --now xtream-strm-web.service
+
+DASHBOARD_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+DASHBOARD_IP=${DASHBOARD_IP:-127.0.0.1}
+echo ""
+echo "Web dashboard: http://$DASHBOARD_IP:8787"
+if [ -n "$DASHBOARD_PASSWORD" ]; then
+  echo "Dashboard password: $DASHBOARD_PASSWORD"
+  echo "Save this password now. It is not shown again unless you reset it."
+fi
 
 if [ "$EXISTING_CONFIG" = yes ]; then
   echo ""
   echo "Xtream STRM was updated successfully. Your existing library was not restarted or re-imported."
   echo "Run a sync whenever you are ready:"
   echo "  sudo xtream-strm"
+  echo "Or open the dashboard: http://$DASHBOARD_IP:8787"
   exit 0
 fi
 

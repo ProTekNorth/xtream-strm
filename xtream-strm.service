@@ -7,6 +7,7 @@ After=network-online.target
 Type=oneshot
 User=xtream-strm
 Group=media
+Environment=XTREAM_STATUS_FILE=/var/lib/xtream-strm/status.json
 ExecStart=/opt/xtream-strm/xtream_strm.py --config /etc/xtream-strm/config.json
 NoNewPrivileges=true
 PrivateTmp=true
