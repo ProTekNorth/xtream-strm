@@ -42,6 +42,8 @@ sudo xtream-strm
 
 The menu can run a complete sync or resumable batch in the terminal with live progress, start a complete sync in the background, watch or check that background job, reconfigure selected settings, and enable or disable scheduled six-hour syncs. It prevents a foreground sync from starting while the background service is already active.
 
+The exporter uses multiple worker threads to load TV-show details and create STRM files concurrently. The default is eight workers. Change it through **Reconfigure settings → Sync behavior** if a provider requires fewer connections or the storage can handle more. One worker disables concurrency; the supported range is 1–32. Sample mode intentionally reads shows sequentially so a small test does not request the entire TV catalog.
+
 ## Test with a small batch first
 
 Preview five movies and five episodes without writing anything:
@@ -179,6 +181,7 @@ Command-line connection settings override environment variables, which override 
 - `jellyfin_poll_seconds`: how often continuous mode checks Jellyfin's library-scan task.
 - `jellyfin_scan_timeout`: maximum seconds to wait for one Jellyfin scan before stopping safely.
 - `jellyfin_verify_tls`: keep enabled unless the local Jellyfin server uses a trusted, known self-signed certificate.
+- `workers`: concurrent TV-detail requests and STRM file operations. Defaults to 8; use 1–32.
 - `verify_tls`: keep enabled. Disable only for a trusted server with a known self-signed certificate.
 - `file_mode` and `directory_mode`: octal permissions applied to generated content.
 
