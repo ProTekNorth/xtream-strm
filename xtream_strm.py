@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -89,6 +89,11 @@ DEFAULTS: dict[str, Any] = {
     "allow_empty_library": False,
     "sample_size": 0,
     "batch_size": 0,
+    "jellyfin_url": "",
+    "jellyfin_api_key": "",
+    "jellyfin_poll_seconds": 15,
+    "jellyfin_scan_timeout": 43200,
+    "jellyfin_verify_tls": True,
     "request_timeout": 30,
     "retries": 3,
     "verify_tls": True,
@@ -188,6 +193,19 @@ def interactive_setup(path: Path) -> None:
         raise SyncError("content selection must be both, movies, or series")
     if not username or not password:
         raise SyncError("username and password are required")
+    jellyfin_url = prompt(
+        "Jellyfin server URL (leave blank to skip automatic batching)",
+        str(existing.get("jellyfin_url", "")) or None,
+    )
+    jellyfin_api_key = str(existing.get("jellyfin_api_key", ""))
+    if jellyfin_url:
+        jellyfin_api_key = prompt(
+            "Jellyfin API key" + (" (press Enter to keep the saved key)" if jellyfin_api_key else ""),
+            jellyfin_api_key,
+            secret=True,
+        )
+        if not jellyfin_api_key:
+            raise SyncError("a Jellyfin API key is required when a Jellyfin server URL is configured")
 
     config = dict(DEFAULTS)
     config.update(existing)
@@ -199,6 +217,9 @@ def interactive_setup(path: Path) -> None:
         "sync_movies": content in {"both", "movies"},
         "sync_series": content in {"both", "series"},
         "sample_size": 0,
+        "batch_size": 0,
+        "jellyfin_url": normalize_server_url(jellyfin_url) if jellyfin_url else "",
+        "jellyfin_api_key": jellyfin_api_key if jellyfin_url else "",
     })
 
     print("\nChecking provider login...")
@@ -262,7 +283,7 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     if args.batch_size is not None:
         config["batch_size"] = args.batch_size
 
-    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "add_provider_ids", "auto_strip_name_tags", "clean_stale", "allow_empty_library", "verify_tls"):
+    for field in ("sync_movies", "sync_series", "category_directories", "normalize_names", "add_provider_ids", "auto_strip_name_tags", "clean_stale", "allow_empty_library", "verify_tls", "jellyfin_verify_tls"):
         config[field] = as_bool(config[field], field)
     if not config["sync_movies"] and not config["sync_series"]:
         raise SyncError("at least one of sync_movies or sync_series must be enabled")
@@ -277,8 +298,10 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         config["retries"] = int(config["retries"])
         config["sample_size"] = int(config["sample_size"])
         config["batch_size"] = int(config["batch_size"])
+        config["jellyfin_poll_seconds"] = int(config["jellyfin_poll_seconds"])
+        config["jellyfin_scan_timeout"] = int(config["jellyfin_scan_timeout"])
     except (TypeError, ValueError) as exc:
-        raise SyncError("request_timeout, retries, sample_size, and batch_size must be numeric") from exc
+        raise SyncError("request_timeout, retries, sample_size, batch_size, and Jellyfin timing settings must be numeric") from exc
     if config["request_timeout"] <= 0 or not 1 <= config["retries"] <= 10:
         raise SyncError("request_timeout must be positive and retries must be between 1 and 10")
     if not 0 <= config["sample_size"] <= 1000:
@@ -287,7 +310,15 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         raise SyncError("batch_size must be between 0 and 10000")
     if config["sample_size"] and config["batch_size"]:
         raise SyncError("sample_size and batch_size cannot both be enabled")
+    if not 5 <= config["jellyfin_poll_seconds"] <= 300:
+        raise SyncError("jellyfin_poll_seconds must be between 5 and 300")
+    if not 60 <= config["jellyfin_scan_timeout"] <= 86400:
+        raise SyncError("jellyfin_scan_timeout must be between 60 and 86400")
     config["server_url"] = normalize_server_url(str(config["server_url"]))
+    config["jellyfin_url"] = normalize_server_url(str(config["jellyfin_url"])) if str(config["jellyfin_url"]).strip() else ""
+    config["jellyfin_api_key"] = str(config["jellyfin_api_key"]).strip()
+    if config["jellyfin_api_key"] and not re.fullmatch(r"[A-Za-z0-9._~-]{8,256}", config["jellyfin_api_key"]):
+        raise SyncError("jellyfin_api_key contains invalid characters")
     config["output_dir"] = Path(str(config["output_dir"])).expanduser().resolve()
     config["file_mode"] = parse_mode(config["file_mode"], "file_mode")
     config["directory_mode"] = parse_mode(config["directory_mode"], "directory_mode")
@@ -348,6 +379,114 @@ class XtreamClient:
         password = quote(self.password, safe="")
         extension = re.sub(r"[^A-Za-z0-9]", "", str(extension or "mp4")) or "mp4"
         return f"{self.base_url}/{kind}/{username}/{password}/{stream_id}.{extension}"
+
+
+class JellyfinClient:
+    """Small Jellyfin API client used only for continuous batch scans."""
+
+    def __init__(self, config: dict[str, Any]):
+        self.base_url = config["jellyfin_url"]
+        self.api_key = config["jellyfin_api_key"]
+        self.timeout = config["request_timeout"]
+        self.poll_seconds = config["jellyfin_poll_seconds"]
+        self.scan_timeout = config["jellyfin_scan_timeout"]
+        self.ssl_context = None
+        if self.base_url.startswith("https://") and not config["jellyfin_verify_tls"]:
+            LOG.warning("Jellyfin TLS certificate verification is disabled")
+            self.ssl_context = ssl._create_unverified_context()
+
+    def request(self, method: str, path: str) -> Any:
+        request = Request(
+            f"{self.base_url}{path}",
+            data=b"" if method == "POST" else None,
+            method=method,
+            headers={
+                "Accept": "application/json",
+                "Authorization": (
+                    f'MediaBrowser Client="xtream-strm", Device="Linux", '
+                    f'DeviceId="xtream-strm", Version="{VERSION}", Token="{self.api_key}"'
+                ),
+                "User-Agent": f"xtream-strm/{VERSION}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.timeout, context=self.ssl_context) as response:
+                raw = response.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8-sig"))
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise SyncError("Jellyfin rejected the API key; create an administrator API key and update the configuration") from exc
+            raise SyncError(f"Jellyfin API request failed with HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise SyncError(f"Jellyfin API request failed: {exc}") from exc
+
+    @staticmethod
+    def value(item: dict[str, Any], name: str) -> Any:
+        for key, value in item.items():
+            if str(key).casefold() == name.casefold():
+                return value
+        return None
+
+    def scan_status(self) -> tuple[str, float | None]:
+        tasks = self.request("GET", "/ScheduledTasks")
+        if not isinstance(tasks, list):
+            raise SyncError("Jellyfin returned an invalid scheduled-task list")
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            key = str(self.value(task, "Key") or "").casefold()
+            name = str(self.value(task, "Name") or "").casefold()
+            if key in {"refreshlibrary", "scanlibrary"} or ("scan" in name and "library" in name):
+                state = str(self.value(task, "State") or "Idle")
+                progress = self.value(task, "CurrentProgressPercentage")
+                try:
+                    percentage = float(progress) if progress is not None else None
+                except (TypeError, ValueError):
+                    percentage = None
+                return state, percentage
+        raise SyncError("Jellyfin's library scan task was not found")
+
+    def wait_until_idle(self, deadline: float, message: str) -> None:
+        last_progress: int | None = None
+        while True:
+            state, progress = self.scan_status()
+            if state.casefold() == "idle":
+                return
+            if time.monotonic() >= deadline:
+                raise SyncError("timed out waiting for Jellyfin's library scan")
+            rounded = int(progress) if progress is not None else None
+            if rounded is not None and rounded != last_progress:
+                LOG.info("%s: %d%%", message, rounded)
+                last_progress = rounded
+            elif last_progress is None:
+                LOG.info("%s", message)
+            time.sleep(self.poll_seconds)
+
+    def refresh_and_wait(self) -> None:
+        deadline = time.monotonic() + self.scan_timeout
+        self.wait_until_idle(deadline, "Waiting for an existing Jellyfin scan to finish")
+        LOG.info("Starting Jellyfin library scan")
+        self.request("POST", "/Library/Refresh")
+        idle_checks = 0
+        last_progress: int | None = None
+        while True:
+            state, progress = self.scan_status()
+            if state.casefold() == "idle":
+                idle_checks += 1
+                if idle_checks >= 2:
+                    LOG.info("Jellyfin library scan finished")
+                    return
+            else:
+                idle_checks = 0
+                rounded = int(progress) if progress is not None else None
+                if rounded is not None and rounded != last_progress:
+                    LOG.info("Jellyfin library scan: %d%%", rounded)
+                    last_progress = rounded
+            if time.monotonic() >= deadline:
+                raise SyncError("timed out waiting for Jellyfin's library scan")
+            time.sleep(self.poll_seconds)
 
 
 def category_map(payload: Any) -> dict[str, str]:
@@ -755,6 +894,7 @@ def build_parser() -> argparse.ArgumentParser:
     sizing.add_argument("--sample", dest="sample_size", nargs="?", type=int, const=5, metavar="SIZE", help="process a small sample (default: 5 per selected library)")
     sizing.add_argument("--batch", dest="batch_size", nargs="?", type=int, const=100, metavar="SIZE", help="process the next resumable batch (default: 100 movies or shows)")
     parser.add_argument("--reset-batch", action="store_true", help="restart resumable batch progress for this provider")
+    parser.add_argument("--continuous", action="store_true", help="repeat batches and wait for Jellyfin to scan each one")
     parser.add_argument("--dry-run", action="store_true", help="show what would change without writing files")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase logging detail")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -771,6 +911,12 @@ def run(argv: list[str] | None = None) -> int:
         config = load_config(args.config, args)
         if args.reset_batch and not config["batch_size"]:
             raise SyncError("--reset-batch must be used together with --batch")
+        if args.continuous and not config["batch_size"]:
+            raise SyncError("--continuous must be used together with --batch")
+        if args.continuous and args.dry_run:
+            raise SyncError("--continuous cannot be used with --dry-run")
+        if args.continuous and (not config["jellyfin_url"] or not config["jellyfin_api_key"]):
+            raise SyncError("--continuous requires jellyfin_url and jellyfin_api_key in the configuration")
         if config["sample_size"]:
             LOG.info("Sample mode: processing at most %d item(s) per selected library; stale cleanup is disabled", config["sample_size"])
         batch = None
@@ -780,33 +926,49 @@ def run(argv: list[str] | None = None) -> int:
         client = XtreamClient(config)
         user = client.authenticate()
         LOG.info("Connected (account status: %s)", user.get("status", "active"))
-        entries: list[Entry] = []
-        if config["sync_movies"]:
-            movies = collect_movies(client, config, batch)
-            if not movies and not config["allow_empty_library"] and not batch:
-                raise SyncError("movie catalog is empty; refusing to replace the existing library (set allow_empty_library to true to permit this)")
-            entries.extend(movies)
-            LOG.info("Found %d movie(s)", len(movies))
-        if config["sync_series"]:
-            episodes = collect_series(client, config, batch)
-            if not episodes and not config["allow_empty_library"] and not batch:
-                raise SyncError("series catalog has no episodes; refusing to replace the existing library (set allow_empty_library to true to permit this)")
-            entries.extend(episodes)
-            LOG.info("Found %d episode(s)", len(episodes))
-        stats = apply_entries(entries, config, args.dry_run)
-        if batch and not args.dry_run:
-            new_movie_count = len(batch.new_movies)
-            new_series_count = len(batch.new_series)
-            save_batch_state(config, batch)
-            LOG.info("Batch progress: %d movie(s) and %d show(s) completed", len(batch.movies), len(batch.series))
-            if config["sync_movies"] and new_movie_count < config["batch_size"]:
-                LOG.info("Movie batching is complete; no additional unprocessed movies were found")
-            if config["sync_series"] and new_series_count < config["batch_size"]:
-                LOG.info("Series batching is complete; no additional unprocessed shows were found")
-        elif batch:
-            LOG.info("Dry run: batch progress was not saved")
-        prefix = "Dry run complete" if args.dry_run else "Sync complete"
-        LOG.info("%s: %d created, %d updated, %d unchanged, %d removed", prefix, stats.created, stats.updated, stats.unchanged, stats.removed)
+        jellyfin = JellyfinClient(config) if args.continuous else None
+        if jellyfin:
+            jellyfin.scan_status()
+            LOG.info("Connected to Jellyfin; continuous batching is enabled")
+
+        while True:
+            entries: list[Entry] = []
+            if config["sync_movies"]:
+                movies = collect_movies(client, config, batch)
+                if not movies and not config["allow_empty_library"] and not batch:
+                    raise SyncError("movie catalog is empty; refusing to replace the existing library (set allow_empty_library to true to permit this)")
+                entries.extend(movies)
+                LOG.info("Found %d movie(s)", len(movies))
+            if config["sync_series"]:
+                episodes = collect_series(client, config, batch)
+                if not episodes and not config["allow_empty_library"] and not batch:
+                    raise SyncError("series catalog has no episodes; refusing to replace the existing library (set allow_empty_library to true to permit this)")
+                entries.extend(episodes)
+                LOG.info("Found %d episode(s)", len(episodes))
+            stats = apply_entries(entries, config, args.dry_run)
+            new_movie_count = len(batch.new_movies) if batch else 0
+            new_series_count = len(batch.new_series) if batch else 0
+            if batch and not args.dry_run:
+                save_batch_state(config, batch)
+                LOG.info("Batch progress: %d movie(s) and %d show(s) completed", len(batch.movies), len(batch.series))
+                if config["sync_movies"] and new_movie_count < config["batch_size"]:
+                    LOG.info("Movie batching is complete; no additional unprocessed movies were found")
+                if config["sync_series"] and new_series_count < config["batch_size"]:
+                    LOG.info("Series batching is complete; no additional unprocessed shows were found")
+            elif batch:
+                LOG.info("Dry run: batch progress was not saved")
+            prefix = "Dry run complete" if args.dry_run else "Sync complete"
+            LOG.info("%s: %d created, %d updated, %d unchanged, %d removed", prefix, stats.created, stats.updated, stats.unchanged, stats.removed)
+
+            if not jellyfin:
+                break
+            if new_movie_count + new_series_count == 0:
+                LOG.info("Continuous import is complete")
+                break
+            if entries:
+                jellyfin.refresh_and_wait()
+            else:
+                LOG.info("The batch contained no playable episodes; continuing to the next batch")
         return 0
     except (SyncError, OSError) as exc:
         LOG.error("%s", exc)
