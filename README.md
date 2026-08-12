@@ -28,7 +28,7 @@ cd xtream-strm
 sudo sh install.sh
 ```
 
-The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. After checking the login, it displays the provider's numbered movie and TV groups so you can import all groups or select individual numbers and ranges. It then creates a five-item sample. You can choose a gradual initial import, a complete import, or stop after the sample. Gradual import is recommended for very large Jellyfin libraries.
+The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. After checking the login, it displays the provider's numbered movie and TV groups so you can import all groups or select individual numbers and ranges. It then creates a five-item sample. You can choose a gradual initial import, a complete import, or stop after the sample. Gradual import is recommended for very large Jellyfin libraries. Interactive runs show progress bars while provider catalogs are downloaded, movies and shows are scanned, STRM files are written, stale files are cleaned, and Jellyfin scans are running.
 
 If Python 3 or curl is missing, the installer installs it automatically using `apt`, `dnf`, `yum`, `zypper`, `apk`, or `pacman`. Python 3.10 or newer is required.
 
@@ -92,6 +92,10 @@ sudo systemctl start xtream-strm.service
 sudo journalctl -u xtream-strm.service -n 100
 sudo /opt/xtream-strm/xtream_strm.py --setup --config /etc/xtream-strm/config.json
 ```
+
+When a configuration already exists, setup presents a menu. You can change only the provider login, library directory, content/groups, Jellyfin connection, or sync behavior; select multiple sections with an entry such as `2,3`. Settings outside those sections are preserved. If the provider account changes, setup also refreshes its group selection because group IDs are provider-specific.
+
+Rerunning the internet installer offers the same menu. Updating an existing installation no longer forces another sample or restarts the full import.
 
 Python 3.10 or newer is required. No Python packages need to be installed.
 
