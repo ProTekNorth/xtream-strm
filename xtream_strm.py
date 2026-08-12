@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -66,6 +66,58 @@ class BatchState:
     series: set[str] = field(default_factory=set)
     new_movies: set[str] = field(default_factory=set)
     new_series: set[str] = field(default_factory=set)
+
+
+class ProgressBar:
+    """Small dependency-free terminal progress bar that stays quiet in service logs."""
+
+    def __init__(self, label: str, total: int = 0, enabled: bool | None = None):
+        self.label = label
+        self.total = max(0, int(total))
+        self.current = 0
+        self.detail = ""
+        self.enabled = sys.stderr.isatty() if enabled is None else enabled
+        self._last_length = 0
+        self._pulse = 0
+
+    def update(self, current: int | None = None, detail: str = "") -> None:
+        if current is not None:
+            self.current = max(0, int(current))
+        self.detail = safe_name(detail, "", 50) if detail else ""
+        if not self.enabled:
+            return
+        if self.total:
+            current_value = min(self.current, self.total)
+            ratio = current_value / self.total
+            width = 28
+            filled = int(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            status = f"[{bar}] {current_value}/{self.total} {ratio * 100:5.1f}%"
+        else:
+            spinner = "|/-\\"[self._pulse % 4]
+            self._pulse += 1
+            status = f"[{spinner}] {self.current:,} bytes"
+        suffix = f"  {self.detail}" if self.detail else ""
+        line = f"{self.label}: {status}{suffix}"
+        padding = " " * max(0, self._last_length - len(line))
+        sys.stderr.write("\r" + line + padding)
+        sys.stderr.flush()
+        self._last_length = len(line)
+
+    def finish(self, detail: str = "") -> None:
+        if detail:
+            self.detail = detail
+        self.update(self.current, self.detail)
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    def __enter__(self) -> "ProgressBar":
+        self.update(0)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.finish("failed" if exc_type else self.detail)
 
 
 DEFAULTS: dict[str, Any] = {
@@ -168,6 +220,45 @@ def prompt(label: str, default: str | None = None, secret: bool = False) -> str:
     return value or (default or "")
 
 
+def prompt_bool(label: str, default: bool) -> bool:
+    answer = prompt(label, "yes" if default else "no").casefold()
+    if answer in {"y", "yes", "true", "1"}:
+        return True
+    if answer in {"n", "no", "false", "0"}:
+        return False
+    raise SyncError(f"{label.lower()} must be yes or no")
+
+
+def choose_setup_sections() -> set[str]:
+    print("What would you like to reconfigure?")
+    print("  1) Provider login")
+    print("  2) Library directory")
+    print("  3) Content and provider groups")
+    print("  4) Jellyfin connection")
+    print("  5) Sync behavior")
+    print("  6) Everything")
+    print("  7) Cancel")
+    print("You can choose more than one section, such as 2,3.")
+    answer = prompt("Selection", "3").casefold()
+    if answer in {"6", "all", "*"}:
+        return {"provider", "library", "content", "jellyfin", "behavior"}
+    if answer in {"7", "cancel", "q", "quit"}:
+        return set()
+    mapping = {
+        "1": "provider",
+        "2": "library",
+        "3": "content",
+        "4": "jellyfin",
+        "5": "behavior",
+    }
+    sections: set[str] = set()
+    for value in (part.strip() for part in answer.split(",")):
+        if value not in mapping:
+            raise SyncError("configuration selection must use numbers 1 through 7")
+        sections.add(mapping[value])
+    return sections
+
+
 def choose_category_ids(label: str, categories: dict[str, str], existing: Any = None) -> list[str]:
     if not categories:
         print(f"No {label.lower()} groups were returned by the provider.")
@@ -225,75 +316,117 @@ def interactive_setup(path: Path) -> None:
         except (OSError, json.JSONDecodeError):
             pass
 
-    print("\nXtream STRM guided setup")
-    print("Use only a provider and video library you are authorized to access.\n")
-    raw_url = prompt("Provider server or full playlist URL", str(existing.get("server_url", "")) or None)
-    if not raw_url:
-        raise SyncError("a provider server URL is required")
-    server_url, url_username, url_password = connection_from_input(raw_url)
-    username = prompt("Username", str(existing.get("username") or url_username or "") or None)
-    password_default = str(existing.get("password") or url_password or "")
-    password = prompt("Password" + (" (press Enter to use the detected or saved value)" if password_default else ""), password_default, secret=True)
-    output_dir = str(Path(prompt("Library directory", str(existing.get("output_dir", "/srv/media/xtream")))).expanduser().resolve())
-    existing_content = "both"
-    if existing.get("sync_movies") is True and existing.get("sync_series") is False:
-        existing_content = "movies"
-    elif existing.get("sync_movies") is False and existing.get("sync_series") is True:
-        existing_content = "series"
-    content = prompt("Content to export: both, movies, or series", existing_content).lower()
-    if content not in {"both", "movies", "series"}:
-        raise SyncError("content selection must be both, movies, or series")
-    if not username or not password:
-        raise SyncError("username and password are required")
-    jellyfin_url = prompt(
-        "Jellyfin server URL (leave blank to skip automatic batching)",
-        str(existing.get("jellyfin_url", "")) or None,
-    )
-    jellyfin_api_key = str(existing.get("jellyfin_api_key", ""))
-    if jellyfin_url:
-        jellyfin_api_key = prompt(
-            "Jellyfin API key" + (" (press Enter to keep the saved key)" if jellyfin_api_key else ""),
-            jellyfin_api_key,
-            secret=True,
-        )
-        if not jellyfin_api_key:
-            raise SyncError("a Jellyfin API key is required when a Jellyfin server URL is configured")
-
     config = dict(DEFAULTS)
     config.update(existing)
-    config.update({
-        "server_url": server_url,
-        "username": username,
-        "password": password,
-        "output_dir": output_dir,
-        "sync_movies": content in {"both", "movies"},
-        "sync_series": content in {"both", "series"},
-        "sample_size": 0,
-        "batch_size": 0,
-        "jellyfin_url": normalize_server_url(jellyfin_url) if jellyfin_url else "",
-        "jellyfin_api_key": jellyfin_api_key if jellyfin_url else "",
-    })
 
-    print("\nChecking provider login...")
-    probe = dict(config)
-    probe["server_url"] = normalize_server_url(str(config["server_url"]))
-    probe["request_timeout"] = float(config["request_timeout"])
-    probe["retries"] = int(config["retries"])
-    probe["verify_tls"] = as_bool(config["verify_tls"], "verify_tls")
-    client = XtreamClient(probe)
-    user = client.authenticate()
-    print(f"Login accepted (status: {user.get('status', 'active')}).")
+    print("\nXtream STRM guided setup")
+    print("Use only a provider and video library you are authorized to access.\n")
+    sections = choose_setup_sections() if existing else {"provider", "library", "content", "jellyfin"}
+    if not sections:
+        print("Configuration was not changed.")
+        return
 
-    if config["sync_movies"]:
-        movie_categories = category_map(client.api("get_vod_categories"))
-        config["movie_category_ids"] = choose_category_ids(
-            "Movie", movie_categories, existing.get("movie_category_ids", [])
+    old_server = str(config.get("server_url", ""))
+    old_username = str(config.get("username", ""))
+    if "provider" in sections:
+        raw_url = prompt("Provider server or full playlist URL", old_server or None)
+        if not raw_url:
+            raise SyncError("a provider server URL is required")
+        server_url, url_username, url_password = connection_from_input(raw_url)
+        username = prompt("Username", str(config.get("username") or url_username or "") or None)
+        password_default = str(config.get("password") or url_password or "")
+        password = prompt(
+            "Password" + (" (press Enter to use the detected or saved value)" if password_default else ""),
+            password_default,
+            secret=True,
         )
-    if config["sync_series"]:
-        series_categories = category_map(client.api("get_series_categories"))
-        config["series_category_ids"] = choose_category_ids(
-            "TV show", series_categories, existing.get("series_category_ids", [])
+        if not username or not password:
+            raise SyncError("username and password are required")
+        config.update({"server_url": server_url, "username": username, "password": password})
+        if (server_url, username) != (old_server, old_username) and "content" not in sections:
+            print("The provider account changed, so its content groups must also be selected.")
+            sections.add("content")
+
+    if "library" in sections:
+        config["output_dir"] = str(Path(prompt(
+            "Library directory", str(config.get("output_dir", "/srv/media/xtream"))
+        )).expanduser().resolve())
+
+    if "content" in sections:
+        existing_content = "both"
+        if config.get("sync_movies") is True and config.get("sync_series") is False:
+            existing_content = "movies"
+        elif config.get("sync_movies") is False and config.get("sync_series") is True:
+            existing_content = "series"
+        content = prompt("Content to export: both, movies, or series", existing_content).lower()
+        if content not in {"both", "movies", "series"}:
+            raise SyncError("content selection must be both, movies, or series")
+        config["sync_movies"] = content in {"both", "movies"}
+        config["sync_series"] = content in {"both", "series"}
+
+    if "jellyfin" in sections:
+        saved_jellyfin_url = str(config.get("jellyfin_url", ""))
+        jellyfin_url = prompt(
+            "Jellyfin server URL (enter none to disable)", saved_jellyfin_url or None
         )
+        if jellyfin_url.casefold() in {"none", "off", "disable"}:
+            jellyfin_url = ""
+        jellyfin_api_key = str(config.get("jellyfin_api_key", ""))
+        if jellyfin_url:
+            jellyfin_api_key = prompt(
+                "Jellyfin API key" + (" (press Enter to keep the saved key)" if jellyfin_api_key else ""),
+                jellyfin_api_key,
+                secret=True,
+            )
+            if not jellyfin_api_key:
+                raise SyncError("a Jellyfin API key is required when a Jellyfin server URL is configured")
+        config["jellyfin_url"] = normalize_server_url(jellyfin_url) if jellyfin_url else ""
+        config["jellyfin_api_key"] = jellyfin_api_key if jellyfin_url else ""
+
+    if "behavior" in sections:
+        config["normalize_names"] = prompt_bool(
+            "Normalize movie and show names", as_bool(config["normalize_names"], "normalize_names")
+        )
+        config["category_directories"] = prompt_bool(
+            "Create provider-group directories", as_bool(config["category_directories"], "category_directories")
+        )
+        config["clean_stale"] = prompt_bool(
+            "Remove stale managed STRM files", as_bool(config["clean_stale"], "clean_stale")
+        )
+        batch_size = prompt("Default batch size (0 means a complete sync)", str(config["batch_size"]))
+        try:
+            config["batch_size"] = int(batch_size)
+        except ValueError as exc:
+            raise SyncError("default batch size must be a number") from exc
+        if not 0 <= config["batch_size"] <= 10000:
+            raise SyncError("default batch size must be between 0 and 10000")
+        if config["batch_size"]:
+            config["sample_size"] = 0
+
+    if "provider" in sections or "content" in sections:
+        for field in ("server_url", "username", "password"):
+            if not str(config.get(field, "")).strip():
+                raise SyncError(f"missing required setting: {field}")
+        print("\nChecking provider login...")
+        probe = dict(config)
+        probe["server_url"] = normalize_server_url(str(config["server_url"]))
+        probe["request_timeout"] = float(config["request_timeout"])
+        probe["retries"] = int(config["retries"])
+        probe["verify_tls"] = as_bool(config["verify_tls"], "verify_tls")
+        client = XtreamClient(probe)
+        user = client.authenticate()
+        print(f"Login accepted (status: {user.get('status', 'active')}).")
+
+        if "content" in sections and config["sync_movies"]:
+            movie_categories = category_map(client.api("get_vod_categories"))
+            config["movie_category_ids"] = choose_category_ids(
+                "Movie", movie_categories, config.get("movie_category_ids", [])
+            )
+        if "content" in sections and config["sync_series"]:
+            series_categories = category_map(client.api("get_series_categories"))
+            config["series_category_ids"] = choose_category_ids(
+                "TV show", series_categories, config.get("series_category_ids", [])
+            )
 
     serializable = {key: config[key] for key in DEFAULTS}
     atomic_write(path.resolve(), json.dumps(serializable, indent=2) + "\n", 0o600, 0o750)
@@ -403,7 +536,7 @@ class XtreamClient:
             LOG.warning("TLS certificate verification is disabled")
             self.ssl_context = ssl._create_unverified_context()
 
-    def api(self, action: str | None = None, **parameters: Any) -> Any:
+    def api(self, action: str | None = None, *, show_progress: bool = True, **parameters: Any) -> Any:
         query: dict[str, Any] = {"username": self.username, "password": self.password}
         if action:
             query["action"] = action
@@ -414,7 +547,34 @@ class XtreamClient:
             try:
                 request = Request(url, headers={"Accept": "application/json", "User-Agent": f"xtream-strm/{VERSION}"})
                 with urlopen(request, timeout=self.timeout, context=self.ssl_context) as response:
-                    raw = response.read()
+                    try:
+                        total_bytes = int(response.headers.get("Content-Length", "0"))
+                    except (TypeError, ValueError):
+                        total_bytes = 0
+                    labels = {
+                        None: "Connecting to provider",
+                        "get_vod_categories": "Loading movie groups",
+                        "get_vod_streams": "Downloading movie catalog",
+                        "get_series_categories": "Loading TV groups",
+                        "get_series": "Downloading TV catalog",
+                        "get_series_info": "Downloading show details",
+                    }
+                    progress = ProgressBar(labels.get(action, "Downloading provider data"), total_bytes) if show_progress else None
+                    chunks: list[bytes] = []
+                    received = 0
+                    if progress:
+                        progress.update(0)
+                    while True:
+                        chunk = response.read(64 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        received += len(chunk)
+                        if progress:
+                            progress.update(received)
+                    if progress:
+                        progress.finish()
+                    raw = b"".join(chunks)
                 return json.loads(raw.decode("utf-8-sig"))
             except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 last_error = exc
@@ -514,18 +674,25 @@ class JellyfinClient:
 
     def wait_until_idle(self, deadline: float, message: str) -> None:
         last_progress: int | None = None
+        progress_bar = ProgressBar(message, 100)
+        progress_bar.update(0)
         while True:
             state, progress = self.scan_status()
             if state.casefold() == "idle":
+                progress_bar.finish("ready")
                 return
             if time.monotonic() >= deadline:
                 raise SyncError("timed out waiting for Jellyfin's library scan")
             rounded = int(progress) if progress is not None else None
             if rounded is not None and rounded != last_progress:
-                LOG.info("%s: %d%%", message, rounded)
+                progress_bar.update(rounded)
+                if not progress_bar.enabled:
+                    LOG.info("%s: %d%%", message, rounded)
                 last_progress = rounded
             elif last_progress is None:
-                LOG.info("%s", message)
+                progress_bar.update(0, "working")
+                if not progress_bar.enabled:
+                    LOG.info("%s", message)
             time.sleep(self.poll_seconds)
 
     def refresh_and_wait(self) -> None:
@@ -535,18 +702,24 @@ class JellyfinClient:
         self.request("POST", "/Library/Refresh")
         idle_checks = 0
         last_progress: int | None = None
+        progress_bar = ProgressBar("Jellyfin library scan", 100)
+        progress_bar.update(0, "starting")
         while True:
             state, progress = self.scan_status()
             if state.casefold() == "idle":
                 idle_checks += 1
                 if idle_checks >= 2:
+                    progress_bar.current = 100
+                    progress_bar.finish("finished")
                     LOG.info("Jellyfin library scan finished")
                     return
             else:
                 idle_checks = 0
                 rounded = int(progress) if progress is not None else None
                 if rounded is not None and rounded != last_progress:
-                    LOG.info("Jellyfin library scan: %d%%", rounded)
+                    progress_bar.update(rounded)
+                    if not progress_bar.enabled:
+                        LOG.info("Jellyfin library scan: %d%%", rounded)
                     last_progress = rounded
             if time.monotonic() >= deadline:
                 raise SyncError("timed out waiting for Jellyfin's library scan")
@@ -707,7 +880,10 @@ def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchSta
     if not isinstance(streams, list):
         raise SyncError("provider returned an invalid movie list")
     entries = []
-    for item in streams:
+    progress = ProgressBar("Scanning movies", len(streams), enabled=None if streams else False)
+    progress.update(0)
+    for position, item in enumerate(streams, start=1):
+        progress.update(position, str(item.get("name", "")) if isinstance(item, dict) else "")
         if not isinstance(item, dict) or item.get("stream_id") is None:
             continue
         stream_id = str(item["stream_id"])
@@ -726,6 +902,7 @@ def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchSta
                 break
         if config["sample_size"] and len(entries) >= config["sample_size"]:
             break
+    progress.finish(f"{len(entries)} selected")
     return unique_entries(entries)
 
 
@@ -761,7 +938,10 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         raise SyncError("provider returned an invalid series list")
     entries = []
     total = len(series)
+    progress = ProgressBar("Reading TV shows", total, enabled=None if total else False)
+    progress.update(0)
     for position, show in enumerate(series, start=1):
+        progress.update(position, str(show.get("name", "")) if isinstance(show, dict) else "")
         if not isinstance(show, dict) or show.get("series_id") is None:
             continue
         series_id = str(show["series_id"])
@@ -770,12 +950,12 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         category = categories.get(str(show.get("category_id")), "Uncategorized")
         if not category_allowed(show.get("category_id"), category, "series", config):
             continue
-        detail = client.api("get_series_info", series_id=show["series_id"])
+        detail = client.api("get_series_info", show_progress=False, series_id=show["series_id"])
         info = detail.get("info", {}) if isinstance(detail, dict) else {}
         metadata = {**show, **(info if isinstance(info, dict) else {})}
         show_name = canonical_media_title(show.get("name"), metadata, config, f"Series {show['series_id']}")
         episode_show_name = JELLYFIN_PROVIDER_ID.sub("", show_name).strip()
-        LOG.info("Reading series %d/%d: %s", position, total, show_name)
+        LOG.debug("Reading series %d/%d: %s", position, total, show_name)
         for season, episode in iter_episodes(detail):
             number = episode_number(episode, episode["_fallback_number"])
             episode_title = normalize_media_name(episode.get("title"), config, f"Episode {number}")
@@ -784,11 +964,13 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
             filename = safe_name(f"{episode_show_name} - {code} - {episode_title}") + ".strm"
             entries.append(Entry(folder / filename, client.stream_url("series", episode["id"], episode.get("container_extension"))))
             if config["sample_size"] and len(entries) >= config["sample_size"]:
+                progress.finish(f"{len(entries)} episodes selected")
                 return unique_entries(entries)
         if batch:
             batch.new_series.add(series_id)
             if len(batch.new_series) >= config["batch_size"]:
                 break
+    progress.finish(f"{len(entries)} episodes selected")
     return unique_entries(entries)
 
 
@@ -907,7 +1089,11 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
     }
     preserved_files = old_files - old_managed_files
     stats = Stats()
-    for entry in entries:
+    write_label = "Checking STRM files" if dry_run else "Writing STRM files"
+    write_progress = ProgressBar(write_label, len(entries), enabled=None if entries else False)
+    write_progress.update(0)
+    for position, entry in enumerate(entries, start=1):
+        write_progress.update(position, entry.relative_path.name)
         target = output / entry.relative_path
         content = entry.stream_url + "\n"
         try:
@@ -926,9 +1112,14 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
             LOG.debug("Update %s", entry.relative_path)
             if not dry_run:
                 atomic_write(target, content, config["file_mode"], config["directory_mode"])
+    write_progress.finish()
 
     if config["clean_stale"]:
-        for relative in sorted(old_managed_files - new_files):
+        stale_files = sorted(old_managed_files - new_files)
+        stale_progress = ProgressBar("Cleaning stale files", len(stale_files), enabled=None if stale_files else False)
+        stale_progress.update(0)
+        for position, relative in enumerate(stale_files, start=1):
+            stale_progress.update(position, PurePosixPath(relative).name)
             target = safe_manifest_target(output, relative)
             if target and target.is_file():
                 stats.removed += 1
@@ -936,6 +1127,7 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
                 if not dry_run:
                     target.unlink()
                     remove_empty_parents(target, output)
+        stale_progress.finish()
 
     if not dry_run:
         output.mkdir(parents=True, exist_ok=True)
