@@ -1,6 +1,6 @@
 # Xtream STRM exporter
 
-A dependency-free Linux command-line tool that signs in to an Xtream Codes-compatible provider, reads its movie and series catalogs, and creates Jellyfin/Kodi-compatible `.strm` files.
+A dependency-free Linux command-line tool that signs in to one or more Xtream Codes-compatible providers, merges their movie and series catalogs, and creates one deduplicated Jellyfin/Kodi-compatible `.strm` library.
 
 Only use it with a provider and content library you are authorized to access. A `.strm` file contains a playable provider URL, so it necessarily contains the Xtream username and password. Keep the output directory private and do not publish, sync, or share it.
 
@@ -28,7 +28,13 @@ cd xtream-strm
 sudo sh install.sh
 ```
 
-The installer asks for the provider address (a full M3U/API link is also accepted), username, password, library location, and whether to export movies, series, or both. After checking the login, it displays the provider's numbered movie and TV groups so you can import all groups or select individual numbers and ranges. It then creates a five-item sample. You can choose a gradual initial import, a complete import, or stop after the sample. Gradual import is recommended for very large Jellyfin libraries. Interactive runs show progress bars while provider catalogs are downloaded, movies and shows are scanned, STRM files are written, stale files are cleaned, and Jellyfin scans are running.
+The installer asks for the first provider address (a full M3U/API link is also accepted), username, password, and whether another provider should be added. Each provider has its own numbered movie and TV group selection. It then asks for the library location and whether to export movies, series, or both, and creates a five-item sample. You can choose a gradual initial import, a complete import, or stop after the sample. Gradual import is recommended for very large Jellyfin libraries. Interactive runs show progress bars while provider catalogs are downloaded, movies and shows are scanned, STRM files are written, stale files are cleaned, and Jellyfin scans are running.
+
+## Multiple providers and duplicate merging
+
+Providers are ordered by priority. When two providers contain the same movie or episode, the first provider supplies the STRM URL. Later providers fill movies and episodes missing from higher-priority sources. Shows are merged at the season/episode level and placed in the highest-priority matching show folder.
+
+Matching uses TMDB or IMDb IDs when available, with normalized title and year as a fallback. This removes common duplicate copies without merging unrelated remakes that have different years. A single STRM file uses one provider URL; it does not perform live playback failover. Change provider priority through the provider manager if another source should win duplicates.
 
 If Python 3 or curl is missing, the installer installs it automatically using `apt`, `dnf`, `yum`, `zypper`, `apk`, or `pacman`. Python 3.10 or newer is required.
 
@@ -109,7 +115,7 @@ sudo journalctl -u xtream-strm.service -n 100
 sudo /opt/xtream-strm/xtream_strm.py --setup --config /etc/xtream-strm/config.json
 ```
 
-When a configuration already exists, setup presents a menu. You can change only the provider login, library and media folders, content/groups, Jellyfin connection, or sync behavior; select multiple sections with an entry such as `2,3`. Settings outside those sections are preserved. If the provider account changes, setup also refreshes its group selection because group IDs are provider-specific.
+When a configuration already exists, setup presents a menu. You can change only the provider accounts, library and media folders, content/groups, Jellyfin connection, or sync behavior; select multiple sections with an entry such as `2,3`. Settings outside those sections are preserved. The provider manager supports `add`, `edit N`, `remove N`, and `move N`; list order controls duplicate priority. Provider changes refresh group selections because group IDs are provider-specific.
 
 The library section separately asks for the movie and TV folders. They can be simple names such as `Movies` and `TV Shows`, or nested locations such as `Video/Films` and `Television/Shows`. Both stay beneath the main library directory for safe service permissions and manifest cleanup. They must be separate and cannot be nested inside one another.
 
@@ -174,6 +180,7 @@ Command-line connection settings override environment variables, which override 
 - `include_categories`: exact, case-insensitive category names to include; empty means all.
 - `exclude_categories`: exact, case-insensitive names to skip.
 - `movie_category_ids` and `series_category_ids`: provider group IDs selected by guided setup. Empty means every group of that media type.
+- `providers`: ordered provider accounts. Each provider stores a display name, server URL, credentials, TLS setting, and its own movie and TV group IDs. The first provider wins duplicate streams. Older single-provider configurations migrate automatically.
 - `movies_directory` and `series_directory`: separate movie and TV folder paths beneath `output_dir`. Nested relative paths are supported.
 - `normalize_names`: produce consistent media-server names by cleaning Unicode, HTML entities, whitespace, quality tags, release years, episode numbers, and season numbers.
 - `add_provider_ids`: append a Jellyfin-compatible TMDB or IMDb ID when that ID is already supplied by the Xtream provider. The exporter does not scrape metadata sites or make extra per-movie metadata requests.
