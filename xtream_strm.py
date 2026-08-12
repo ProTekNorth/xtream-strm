@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -199,6 +199,30 @@ def safe_name(value: Any, fallback: str = "Unknown", max_bytes: int = 180) -> st
     return fallback
 
 
+def safe_relative_directory(value: Any, fallback: str) -> str:
+    """Validate and normalize a configurable directory beneath the library root."""
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw:
+        raw = fallback
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        raise SyncError("movie and TV folders must be relative to the main library directory")
+    path = PurePosixPath(raw)
+    if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise SyncError("movie and TV folders cannot contain . or .. path components")
+    return PurePosixPath(*(safe_name(part, "Media") for part in path.parts)).as_posix()
+
+
+def media_directories(config: dict[str, Any]) -> tuple[str, str]:
+    movies = safe_relative_directory(config["movies_directory"], "Movies")
+    series = safe_relative_directory(config["series_directory"], "TV Shows")
+    movie_parts = tuple(part.casefold() for part in PurePosixPath(movies).parts)
+    series_parts = tuple(part.casefold() for part in PurePosixPath(series).parts)
+    shortest = min(len(movie_parts), len(series_parts))
+    if movie_parts[:shortest] == series_parts[:shortest]:
+        raise SyncError("movie and TV folders must be separate and cannot be nested inside one another")
+    return movies, series
+
+
 def parse_mode(value: Any, field: str) -> int:
     try:
         mode = int(str(value), 8)
@@ -256,7 +280,7 @@ def prompt_bool(label: str, default: bool) -> bool:
 def choose_setup_sections() -> set[str]:
     print("What would you like to reconfigure?")
     print("  1) Provider login")
-    print("  2) Library directory")
+    print("  2) Library and media folders")
     print("  3) Content and provider groups")
     print("  4) Jellyfin connection")
     print("  5) Sync behavior")
@@ -375,6 +399,15 @@ def interactive_setup(path: Path) -> None:
         config["output_dir"] = str(Path(prompt(
             "Library directory", str(config.get("output_dir", "/srv/media/xtream"))
         )).expanduser().resolve())
+        config["movies_directory"] = safe_relative_directory(
+            prompt("Movies folder within the library", str(config.get("movies_directory", "Movies"))),
+            "Movies",
+        )
+        config["series_directory"] = safe_relative_directory(
+            prompt("TV shows folder within the library", str(config.get("series_directory", "TV Shows"))),
+            "TV Shows",
+        )
+        config["movies_directory"], config["series_directory"] = media_directories(config)
 
     if "content" in sections:
         existing_content = "both"
@@ -553,8 +586,7 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     config["output_dir"] = Path(str(config["output_dir"])).expanduser().resolve()
     config["file_mode"] = parse_mode(config["file_mode"], "file_mode")
     config["directory_mode"] = parse_mode(config["directory_mode"], "directory_mode")
-    config["movies_directory"] = safe_name(config["movies_directory"], "Movies")
-    config["series_directory"] = safe_name(config["series_directory"], "TV Shows")
+    config["movies_directory"], config["series_directory"] = media_directories(config)
     return config
 
 
@@ -1129,15 +1161,18 @@ def apply_entries(entries: list[Entry], config: dict[str, Any], dry_run: bool) -
     old_files = read_manifest(output) if output.exists() else set()
     new_files = {entry.relative_path.as_posix() for entry in entries}
     partial_mode = config["sample_size"] > 0 or config["batch_size"] > 0
-    active_roots = set()
+    active_roots: list[tuple[str, ...]] = []
     if config["sync_movies"]:
-        active_roots.add(config["movies_directory"].casefold())
+        active_roots.append(tuple(part.casefold() for part in PurePosixPath(config["movies_directory"]).parts))
     if config["sync_series"]:
-        active_roots.add(config["series_directory"].casefold())
+        active_roots.append(tuple(part.casefold() for part in PurePosixPath(config["series_directory"]).parts))
     old_managed_files = set() if partial_mode else {
         relative
         for relative in old_files
-        if PurePosixPath(relative).parts and PurePosixPath(relative).parts[0].casefold() in active_roots
+        if any(
+            tuple(part.casefold() for part in PurePosixPath(relative).parts[:len(root)]) == root
+            for root in active_roots
+        )
     }
     preserved_files = old_files - old_managed_files
     stats = Stats()
