@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.8.1"
+VERSION = "2.0.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -52,6 +52,9 @@ class SyncError(RuntimeError):
 class Entry:
     relative_path: Path
     stream_url: str
+    identity: str = ""
+    collection_identity: str = ""
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass
@@ -163,6 +166,7 @@ DEFAULTS: dict[str, Any] = {
     "exclude_categories": [],
     "movie_category_ids": [],
     "series_category_ids": [],
+    "providers": [],
     "clean_stale": True,
     "allow_empty_library": False,
     "sample_size": 0,
@@ -262,6 +266,68 @@ def connection_from_input(value: str) -> tuple[str, str | None, str | None]:
     return normalize_server_url(server_url), username, password
 
 
+PROVIDER_FIELDS = {
+    "name", "server_url", "username", "password", "movie_category_ids", "series_category_ids", "verify_tls"
+}
+
+
+def legacy_provider(config: dict[str, Any]) -> dict[str, Any]:
+    host = urlsplit(str(config.get("server_url", ""))).hostname or "Primary"
+    return {
+        "name": safe_name(config.get("provider_name") or host, "Primary", 80),
+        "server_url": str(config.get("server_url", "")),
+        "username": str(config.get("username", "")),
+        "password": str(config.get("password", "")),
+        "movie_category_ids": list(config.get("movie_category_ids", [])),
+        "series_category_ids": list(config.get("series_category_ids", [])),
+        "verify_tls": config.get("verify_tls", True),
+    }
+
+
+def normalize_providers(config: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = config.get("providers")
+    if raw in (None, []):
+        raw = [legacy_provider(config)]
+    if not isinstance(raw, list) or not raw:
+        raise SyncError("providers must be a non-empty list")
+    providers: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise SyncError(f"provider {index} must be an object")
+        unknown = sorted(set(item) - PROVIDER_FIELDS)
+        if unknown:
+            raise SyncError(f"unknown option(s) for provider {index}: {', '.join(unknown)}")
+        provider = {
+            "name": safe_name(item.get("name"), f"Provider {index}", 80),
+            "server_url": normalize_server_url(str(item.get("server_url", ""))),
+            "username": str(item.get("username", "")).strip(),
+            "password": str(item.get("password", "")),
+            "movie_category_ids": item.get("movie_category_ids", []),
+            "series_category_ids": item.get("series_category_ids", []),
+            "verify_tls": as_bool(item.get("verify_tls", True), f"providers[{index}].verify_tls"),
+        }
+        if not provider["username"] or not provider["password"]:
+            raise SyncError(f"provider {index} requires a username and password")
+        for field in ("movie_category_ids", "series_category_ids"):
+            if not isinstance(provider[field], list) or not all(isinstance(value, str) for value in provider[field]):
+                raise SyncError(f"providers[{index}].{field} must be a list of strings")
+        folded = provider["name"].casefold()
+        if folded in names:
+            raise SyncError(f"provider names must be unique: {provider['name']}")
+        names.add(folded)
+        providers.append(provider)
+    return providers
+
+
+def provider_config(config: dict[str, Any], provider: dict[str, Any]) -> dict[str, Any]:
+    result = dict(config)
+    result.update({key: provider[key] for key in (
+        "server_url", "username", "password", "movie_category_ids", "series_category_ids", "verify_tls"
+    )})
+    return result
+
+
 def prompt(label: str, default: str | None = None, secret: bool = False) -> str:
     suffix = f" [{default}]" if default and not secret else ""
     reader = getpass.getpass if secret else input
@@ -280,7 +346,7 @@ def prompt_bool(label: str, default: bool) -> bool:
 
 def choose_setup_sections() -> set[str]:
     print("What would you like to reconfigure?")
-    print("  1) Provider login")
+    print("  1) Provider accounts and priority")
     print("  2) Library and media folders")
     print("  3) Content and provider groups")
     print("  4) Jellyfin connection")
@@ -353,6 +419,76 @@ def choose_category_ids(label: str, categories: dict[str, str], existing: Any = 
     return result
 
 
+def prompt_provider(existing: dict[str, Any] | None, index: int) -> dict[str, Any]:
+    saved = existing or {}
+    name = prompt("Provider name", str(saved.get("name", f"Provider {index}")))
+    raw_url = prompt("Provider server or full playlist URL", str(saved.get("server_url", "")) or None)
+    if not raw_url:
+        raise SyncError("a provider server URL is required")
+    server_url, url_username, url_password = connection_from_input(raw_url)
+    username = prompt("Username", str(saved.get("username") or url_username or "") or None)
+    password_default = str(saved.get("password") or url_password or "")
+    password = prompt(
+        "Password" + (" (press Enter to keep the saved value)" if password_default else ""),
+        password_default,
+        secret=True,
+    )
+    if not username or not password:
+        raise SyncError("username and password are required")
+    return {
+        "name": safe_name(name, f"Provider {index}", 80),
+        "server_url": server_url,
+        "username": username,
+        "password": password,
+        "movie_category_ids": list(saved.get("movie_category_ids", [])),
+        "series_category_ids": list(saved.get("series_category_ids", [])),
+        "verify_tls": saved.get("verify_tls", True),
+    }
+
+
+def manage_provider_credentials(config: dict[str, Any], first_setup: bool) -> None:
+    if first_setup:
+        providers = [prompt_provider(None, 1)]
+        while prompt_bool("Add another provider", False):
+            providers.append(prompt_provider(None, len(providers) + 1))
+        config["providers"] = providers
+        return
+
+    providers = list(config.get("providers") or [legacy_provider(config)])
+    while True:
+        print("\nConfigured providers (highest priority first):")
+        for index, provider in enumerate(providers, start=1):
+            print(f"  {index}) {provider['name']} - {provider['server_url']}")
+        print("Commands: add, edit N, remove N, move N, or done")
+        command = prompt("Provider command", "done").strip().casefold()
+        if command in {"done", "d", "q", "quit"}:
+            break
+        if command in {"add", "a"}:
+            providers.append(prompt_provider(None, len(providers) + 1))
+            continue
+        match = re.fullmatch(r"(edit|remove|move)\s+(\d+)", command)
+        if not match:
+            raise SyncError("provider command must be add, edit N, remove N, move N, or done")
+        action, raw_index = match.groups()
+        index = int(raw_index) - 1
+        if not 0 <= index < len(providers):
+            raise SyncError("provider number is out of range")
+        if action == "edit":
+            providers[index] = prompt_provider(providers[index], index + 1)
+        elif action == "remove":
+            if len(providers) == 1:
+                raise SyncError("at least one provider is required")
+            removed = providers.pop(index)
+            print(f"Removed {removed['name']}.")
+        else:
+            destination = prompt("New priority number", str(index + 1))
+            if not destination.isdigit() or not 1 <= int(destination) <= len(providers):
+                raise SyncError("new priority must be a configured provider number")
+            provider = providers.pop(index)
+            providers.insert(int(destination) - 1, provider)
+    config["providers"] = providers
+
+
 def interactive_setup(path: Path) -> None:
     if not sys.stdin.isatty():
         raise SyncError("guided setup needs an interactive terminal")
@@ -367,6 +503,14 @@ def interactive_setup(path: Path) -> None:
 
     config = dict(DEFAULTS)
     config.update(existing)
+    if existing:
+        try:
+            config["providers"] = list(config.get("providers") or [legacy_provider(config)])
+            primary = config["providers"][0]
+            for field in ("server_url", "username", "password", "movie_category_ids", "series_category_ids", "verify_tls"):
+                config[field] = primary[field]
+        except (IndexError, TypeError):
+            raise SyncError("the saved provider list is invalid")
 
     print("\nXtream STRM guided setup")
     print("Use only a provider and video library you are authorized to access.\n")
@@ -375,26 +519,9 @@ def interactive_setup(path: Path) -> None:
         print("Configuration was not changed.")
         return
 
-    old_server = str(config.get("server_url", ""))
-    old_username = str(config.get("username", ""))
     if "provider" in sections:
-        raw_url = prompt("Provider server or full playlist URL", old_server or None)
-        if not raw_url:
-            raise SyncError("a provider server URL is required")
-        server_url, url_username, url_password = connection_from_input(raw_url)
-        username = prompt("Username", str(config.get("username") or url_username or "") or None)
-        password_default = str(config.get("password") or url_password or "")
-        password = prompt(
-            "Password" + (" (press Enter to use the detected or saved value)" if password_default else ""),
-            password_default,
-            secret=True,
-        )
-        if not username or not password:
-            raise SyncError("username and password are required")
-        config.update({"server_url": server_url, "username": username, "password": password})
-        if (server_url, username) != (old_server, old_username) and "content" not in sections:
-            print("The provider account changed, so its content groups must also be selected.")
-            sections.add("content")
+        manage_provider_credentials(config, not existing)
+        sections.add("content")
 
     if "library" in sections:
         config["output_dir"] = str(Path(prompt(
@@ -469,30 +596,37 @@ def interactive_setup(path: Path) -> None:
             raise SyncError("concurrent workers must be between 1 and 32")
 
     if "provider" in sections or "content" in sections:
-        for field in ("server_url", "username", "password"):
-            if not str(config.get(field, "")).strip():
-                raise SyncError(f"missing required setting: {field}")
-        print("\nChecking provider login...")
-        probe = dict(config)
-        probe["server_url"] = normalize_server_url(str(config["server_url"]))
-        probe["request_timeout"] = float(config["request_timeout"])
-        probe["retries"] = int(config["retries"])
-        probe["verify_tls"] = as_bool(config["verify_tls"], "verify_tls")
-        client = XtreamClient(probe)
-        user = client.authenticate()
-        print(f"Login accepted (status: {user.get('status', 'active')}).")
+        providers = config.get("providers") or [legacy_provider(config)]
+        for provider in providers:
+            print(f"\nChecking provider: {provider['name']}...")
+            probe = provider_config(config, provider)
+            probe["server_url"] = normalize_server_url(str(provider["server_url"]))
+            probe["request_timeout"] = float(config["request_timeout"])
+            probe["retries"] = int(config["retries"])
+            probe["verify_tls"] = as_bool(provider.get("verify_tls", True), "verify_tls")
+            client = XtreamClient(probe)
+            user = client.authenticate()
+            print(f"Login accepted for {provider['name']} (status: {user.get('status', 'active')}).")
 
-        if "content" in sections and config["sync_movies"]:
-            movie_categories = category_map(client.api("get_vod_categories"))
-            config["movie_category_ids"] = choose_category_ids(
-                "Movie", movie_categories, config.get("movie_category_ids", [])
-            )
-        if "content" in sections and config["sync_series"]:
-            series_categories = category_map(client.api("get_series_categories"))
-            config["series_category_ids"] = choose_category_ids(
-                "TV show", series_categories, config.get("series_category_ids", [])
-            )
+            if "content" in sections and config["sync_movies"]:
+                movie_categories = category_map(client.api("get_vod_categories"))
+                provider["movie_category_ids"] = choose_category_ids(
+                    f"{provider['name']} movie", movie_categories, provider.get("movie_category_ids", [])
+                )
+            if "content" in sections and config["sync_series"]:
+                series_categories = category_map(client.api("get_series_categories"))
+                provider["series_category_ids"] = choose_category_ids(
+                    f"{provider['name']} TV show", series_categories, provider.get("series_category_ids", [])
+                )
+        config["providers"] = providers
+        primary = providers[0]
+        for field in ("server_url", "username", "password", "movie_category_ids", "series_category_ids", "verify_tls"):
+            config[field] = primary[field]
 
+    config["providers"] = normalize_providers(config)
+    primary = config["providers"][0]
+    for field in ("server_url", "username", "password", "movie_category_ids", "series_category_ids", "verify_tls"):
+        config[field] = primary[field]
     serializable = {key: config[key] for key in DEFAULTS}
     atomic_write(path.resolve(), json.dumps(serializable, indent=2) + "\n", 0o600, 0o750)
     print(f"Configuration saved to {path.resolve()}")
@@ -528,11 +662,22 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         "password": os.getenv("XTREAM_PASSWORD"),
         "output_dir": os.getenv("XTREAM_OUTPUT"),
     }
+    provider_override = any(environment[key] is not None for key in ("server_url", "username", "password"))
     config.update({key: value for key, value in environment.items() if value is not None})
     for key in ("server_url", "username", "password", "output_dir"):
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+            if key in {"server_url", "username", "password"}:
+                provider_override = True
+    if provider_override and config.get("providers"):
+        if isinstance(config["providers"], list) and config["providers"] and isinstance(config["providers"][0], dict):
+            config["providers"] = [dict(provider) if isinstance(provider, dict) else provider for provider in config["providers"]]
+            config["providers"][0].update({
+                "server_url": config["server_url"],
+                "username": config["username"],
+                "password": config["password"],
+            })
 
     if args.movies_only:
         config["sync_movies"], config["sync_series"] = True, False
@@ -549,7 +694,7 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         config[field] = as_bool(config[field], field)
     if not config["sync_movies"] and not config["sync_series"]:
         raise SyncError("at least one of sync_movies or sync_series must be enabled")
-    for field in ("server_url", "username", "password", "output_dir"):
+    for field in ("output_dir",):
         if not str(config[field]).strip():
             raise SyncError(f"missing required setting: {field}")
     for field in ("include_categories", "exclude_categories", "movie_category_ids", "series_category_ids", "strip_name_prefixes", "preserve_name_prefixes"):
@@ -579,7 +724,6 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
         raise SyncError("jellyfin_poll_seconds must be between 5 and 300")
     if not 60 <= config["jellyfin_scan_timeout"] <= 86400:
         raise SyncError("jellyfin_scan_timeout must be between 60 and 86400")
-    config["server_url"] = normalize_server_url(str(config["server_url"]))
     config["jellyfin_url"] = normalize_server_url(str(config["jellyfin_url"])) if str(config["jellyfin_url"]).strip() else ""
     config["jellyfin_api_key"] = str(config["jellyfin_api_key"]).strip()
     if config["jellyfin_api_key"] and not re.fullmatch(r"[A-Za-z0-9._~-]{8,256}", config["jellyfin_api_key"]):
@@ -588,6 +732,10 @@ def load_config(path: Path | None, args: argparse.Namespace) -> dict[str, Any]:
     config["file_mode"] = parse_mode(config["file_mode"], "file_mode")
     config["directory_mode"] = parse_mode(config["directory_mode"], "directory_mode")
     config["movies_directory"], config["series_directory"] = media_directories(config)
+    config["providers"] = normalize_providers(config)
+    primary = config["providers"][0]
+    for field in ("server_url", "username", "password", "movie_category_ids", "series_category_ids", "verify_tls"):
+        config[field] = primary[field]
     return config
 
 
@@ -915,6 +1063,55 @@ def canonical_media_title(value: Any, item: dict[str, Any], config: dict[str, An
     return add_jellyfin_provider_id(title, item, config, fallback)
 
 
+def media_identity(kind: str, title: str, item: dict[str, Any]) -> str:
+    suffix = provider_id_suffix(item)
+    if suffix:
+        return f"{kind}:{suffix.casefold()}"
+    return fallback_media_identity(kind, title)
+
+
+def fallback_media_identity(kind: str, title: str) -> str:
+    normalized = JELLYFIN_PROVIDER_ID.sub("", title).casefold()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+    return f"{kind}:title:{normalized}"
+
+
+def merge_provider_entries(provider_entries: Iterable[tuple[str, list[Entry]]]) -> tuple[list[Entry], int]:
+    """Merge ordered providers; the first provider wins duplicates and later providers fill gaps."""
+    merged: list[Entry] = []
+    seen: set[str] = set()
+    canonical_show_folders: dict[str, Path] = {}
+    duplicates = 0
+    for provider_name, entries in provider_entries:
+        for entry in entries:
+            identity = entry.identity or f"path:{entry.relative_path.as_posix().casefold()}"
+            keys = (identity, *entry.aliases)
+            if any(key in seen for key in keys):
+                duplicates += 1
+                LOG.debug("Merged duplicate from %s: %s", provider_name, entry.relative_path)
+                continue
+            seen.update(keys)
+            adjusted = entry
+            if entry.collection_identity:
+                show_folder = entry.relative_path.parent.parent
+                canonical = canonical_show_folders.setdefault(entry.collection_identity, show_folder)
+                if show_folder != canonical:
+                    filename = entry.relative_path.name
+                    marker = re.search(r" - (S\d{2}E\d{2} - .+)$", entry.relative_path.stem, re.IGNORECASE)
+                    if marker:
+                        prefix = JELLYFIN_PROVIDER_ID.sub("", canonical.name).strip()
+                        filename = safe_name(f"{prefix} - {marker.group(1)}") + ".strm"
+                    adjusted = Entry(
+                        canonical / entry.relative_path.parent.name / filename,
+                        entry.stream_url,
+                        entry.identity,
+                        entry.collection_identity,
+                        entry.aliases,
+                    )
+            merged.append(adjusted)
+    return unique_entries(merged), duplicates
+
+
 def parse_number(value: Any, fallback: int, specials_are_zero: bool = False) -> int:
     text = str(value or "").strip()
     if specials_are_zero and text.casefold() in {"special", "specials", "extra", "extras"}:
@@ -937,11 +1134,13 @@ def unique_entries(entries: Iterable[Entry]) -> list[Entry]:
             candidate = path.with_name(f"{path.stem} [{counter}]{path.suffix}")
             counter += 1
         used.add(candidate.as_posix().casefold())
-        result.append(Entry(candidate, entry.stream_url))
+        result.append(Entry(candidate, entry.stream_url, entry.identity, entry.collection_identity, entry.aliases))
     return result
 
 
-def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchState | None = None) -> list[Entry]:
+def collect_movies(
+    client: XtreamClient, config: dict[str, Any], batch: BatchState | None = None, batch_prefix: str = ""
+) -> list[Entry]:
     categories = category_map(client.api("get_vod_categories"))
     streams = client.api("get_vod_streams")
     if not isinstance(streams, list):
@@ -954,7 +1153,8 @@ def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         if not isinstance(item, dict) or item.get("stream_id") is None:
             continue
         stream_id = str(item["stream_id"])
-        if batch and stream_id in batch.movies:
+        batch_id = f"{batch_prefix}{stream_id}"
+        if batch and batch_id in batch.movies:
             continue
         category = categories.get(str(item.get("category_id")), "Uncategorized")
         if not category_allowed(item.get("category_id"), category, "movie", config):
@@ -962,9 +1162,17 @@ def collect_movies(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         display = canonical_media_title(item.get("name"), item, config, f"Movie {item['stream_id']}")
         folder = with_category(config["movies_directory"], category, config) / display
         path = folder / f"{display}.strm"
-        entries.append(Entry(path, client.stream_url("movie", item["stream_id"], item.get("container_extension"))))
+        identity = media_identity("movie", display, item)
+        fallback_identity = fallback_media_identity("movie", display)
+        entries.append(Entry(
+            path,
+            client.stream_url("movie", item["stream_id"], item.get("container_extension")),
+            identity,
+            "",
+            (fallback_identity,) if fallback_identity != identity else (),
+        ))
         if batch:
-            batch.new_movies.add(stream_id)
+            batch.new_movies.add(batch_id)
             if len(batch.new_movies) >= config["batch_size"]:
                 break
         if config["sample_size"] and len(entries) >= config["sample_size"]:
@@ -998,7 +1206,9 @@ def iter_episodes(payload: Any) -> Iterable[tuple[int, dict[str, Any]]]:
             yield max(0, season), {**episode, "_fallback_number": index}
 
 
-def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchState | None = None) -> list[Entry]:
+def collect_series(
+    client: XtreamClient, config: dict[str, Any], batch: BatchState | None = None, batch_prefix: str = ""
+) -> list[Entry]:
     categories = category_map(client.api("get_series_categories"))
     series = client.api("get_series")
     if not isinstance(series, list):
@@ -1008,22 +1218,25 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
         if not isinstance(show, dict) or show.get("series_id") is None:
             continue
         series_id = str(show["series_id"])
-        if batch and series_id in batch.series:
+        batch_id = f"{batch_prefix}{series_id}"
+        if batch and batch_id in batch.series:
             continue
         category = categories.get(str(show.get("category_id")), "Uncategorized")
         if not category_allowed(show.get("category_id"), category, "series", config):
             continue
-        candidates.append((show, category))
+        candidates.append(({**show, "_batch_id": batch_id}, category))
         if batch and len(candidates) >= config["batch_size"]:
             break
 
     def fetch_show(candidate: tuple[dict[str, Any], str]) -> tuple[str, str, list[Entry]]:
         show, category = candidate
-        series_id = str(show["series_id"])
+        series_id = str(show["_batch_id"])
         detail = client.api("get_series_info", show_progress=False, series_id=show["series_id"])
         info = detail.get("info", {}) if isinstance(detail, dict) else {}
         metadata = {**show, **(info if isinstance(info, dict) else {})}
         show_name = canonical_media_title(show.get("name"), metadata, config, f"Series {show['series_id']}")
+        show_identity = media_identity("series", show_name, metadata)
+        fallback_show_identity = fallback_media_identity("series", show_name)
         episode_show_name = JELLYFIN_PROVIDER_ID.sub("", show_name).strip()
         show_entries: list[Entry] = []
         for season, episode in iter_episodes(detail):
@@ -1035,6 +1248,10 @@ def collect_series(client: XtreamClient, config: dict[str, Any], batch: BatchSta
             show_entries.append(Entry(
                 folder / filename,
                 client.stream_url("series", episode["id"], episode.get("container_extension")),
+                f"{show_identity}:s{season:03d}e{number:04d}",
+                fallback_show_identity,
+                ((f"{fallback_show_identity}:s{season:03d}e{number:04d}",)
+                 if fallback_show_identity != show_identity else ()),
             ))
         return series_id, show_name, show_entries
 
@@ -1074,7 +1291,10 @@ def read_manifest(output: Path) -> set[str]:
 
 
 def account_fingerprint(config: dict[str, Any]) -> str:
-    identity = f"{config['server_url']}\0{config['username']}".encode("utf-8")
+    providers = config.get("providers") or [legacy_provider(config)]
+    identity = "\0".join(
+        f"{provider['server_url']}\0{provider['username']}" for provider in providers
+    ).encode("utf-8")
     return hashlib.sha256(identity).hexdigest()
 
 
@@ -1114,6 +1334,18 @@ def save_batch_state(config: dict[str, Any], state: BatchState) -> None:
 
 def pending_signature(config: dict[str, Any]) -> str:
     fields = (
+        "providers", "sync_movies", "sync_series", "movies_directory", "series_directory",
+        "category_directories", "normalize_names", "add_provider_ids", "auto_strip_name_tags",
+        "strip_name_prefixes", "preserve_name_prefixes", "include_categories", "exclude_categories",
+        "movie_category_ids", "series_category_ids", "clean_stale",
+    )
+    payload = {field: config[field] for field in fields}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def legacy_pending_signature(config: dict[str, Any]) -> str:
+    """Signature used by 1.8.x, retained so an in-progress single-provider write can resume after upgrading."""
+    fields = (
         "server_url", "username", "sync_movies", "sync_series", "movies_directory", "series_directory",
         "category_directories", "normalize_names", "add_provider_ids", "auto_strip_name_tags",
         "strip_name_prefixes", "preserve_name_prefixes", "include_categories", "exclude_categories",
@@ -1144,7 +1376,10 @@ def load_pending_entries(config: dict[str, Any]) -> list[Entry] | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") != 1 or payload.get("signature") != pending_signature(config):
+        signatures = {pending_signature(config)}
+        if len(config.get("providers", [])) == 1:
+            signatures.add(legacy_pending_signature(config))
+        if payload.get("version") != 1 or payload.get("signature") not in signatures:
             LOG.warning("Ignoring an old write checkpoint because the provider or folder settings changed")
             return None
         raw_entries = payload.get("entries")
@@ -1354,9 +1589,13 @@ def run(argv: list[str] | None = None) -> int:
         if config["batch_size"]:
             batch = load_batch_state(config, args.reset_batch)
             LOG.info("Batch mode: processing the next %d movie(s) and show(s); stale cleanup is disabled", config["batch_size"])
-        client = XtreamClient(config)
-        user = client.authenticate()
-        LOG.info("Connected (account status: %s)", user.get("status", "active"))
+        provider_clients: list[tuple[str, dict[str, Any], XtreamClient]] = []
+        for provider in config["providers"]:
+            current_config = provider_config(config, provider)
+            client = XtreamClient(current_config)
+            user = client.authenticate()
+            LOG.info("Connected to %s (account status: %s)", provider["name"], user.get("status", "active"))
+            provider_clients.append((provider["name"], current_config, client))
         jellyfin = JellyfinClient(config) if args.continuous else None
         if jellyfin:
             jellyfin.scan_status()
@@ -1367,18 +1606,34 @@ def run(argv: list[str] | None = None) -> int:
             saved_entries = load_pending_entries(config) if checkpoint_enabled else None
             entries: list[Entry] = saved_entries if saved_entries is not None else []
             if saved_entries is None:
-                if config["sync_movies"]:
-                    movies = collect_movies(client, config, batch)
-                    if not movies and not config["allow_empty_library"] and not batch:
-                        raise SyncError("movie catalog is empty; refusing to replace the existing library (set allow_empty_library to true to permit this)")
-                    entries.extend(movies)
-                    LOG.info("Found %d movie(s)", len(movies))
-                if config["sync_series"]:
-                    episodes = collect_series(client, config, batch)
-                    if not episodes and not config["allow_empty_library"] and not batch:
-                        raise SyncError("series catalog has no episodes; refusing to replace the existing library (set allow_empty_library to true to permit this)")
-                    entries.extend(episodes)
-                    LOG.info("Found %d episode(s)", len(episodes))
+                provider_results: list[tuple[str, list[Entry]]] = []
+                for provider_index, (provider_name, current_config, client) in enumerate(provider_clients):
+                    current_entries: list[Entry] = []
+                    batch_prefix = "" if provider_index == 0 else f"p{provider_index}:"
+                    if config["sync_movies"]:
+                        movies = collect_movies(client, current_config, batch, batch_prefix)
+                        current_entries.extend(movies)
+                        LOG.info("%s supplied %d selected movie(s)", provider_name, len(movies))
+                    if config["sync_series"]:
+                        episodes = collect_series(client, current_config, batch, batch_prefix)
+                        current_entries.extend(episodes)
+                        LOG.info("%s supplied %d selected episode(s)", provider_name, len(episodes))
+                    provider_results.append((provider_name, current_entries))
+                entries, duplicate_count = merge_provider_entries(provider_results)
+                if config["sample_size"]:
+                    movies = [entry for entry in entries if entry.identity.startswith("movie:")][:config["sample_size"]]
+                    episodes = [entry for entry in entries if entry.identity.startswith("series:")][:config["sample_size"]]
+                    entries = movies + episodes
+                movie_count = sum(entry.identity.startswith("movie:") for entry in entries)
+                episode_count = sum(entry.identity.startswith("series:") for entry in entries)
+                if config["sync_movies"] and not movie_count and not config["allow_empty_library"] and not batch:
+                    raise SyncError("combined movie catalog is empty; refusing to replace the existing library")
+                if config["sync_series"] and not episode_count and not config["allow_empty_library"] and not batch:
+                    raise SyncError("combined series catalog has no episodes; refusing to replace the existing library")
+                LOG.info(
+                    "Combined library: %d movie(s), %d episode(s), %d duplicate source item(s) merged",
+                    movie_count, episode_count, duplicate_count,
+                )
                 if checkpoint_enabled:
                     save_pending_entries(config, entries)
             stats = apply_entries(entries, config, args.dry_run)
