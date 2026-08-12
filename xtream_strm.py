@@ -27,7 +27,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
@@ -133,7 +133,47 @@ class ProgressBar:
         self.finish("failed" if exc_type else self.detail)
 
 
-_STATUS_LOCK = threading.Lock()
+_STATUS_LOCK = threading.RLock()
+_RUNTIME_METRICS: dict[str, int] = {}
+_RECENT_FOUND: deque[dict[str, str]] = deque(maxlen=16)
+
+
+def reset_runtime_discovery() -> None:
+    """Reset discovery counters at the beginning of a new process run."""
+    with _STATUS_LOCK:
+        _RUNTIME_METRICS.clear()
+        _RUNTIME_METRICS.update({
+            "source_movies": 0,
+            "source_shows": 0,
+            "source_episodes": 0,
+            "library_movies": 0,
+            "library_shows": 0,
+            "library_episodes": 0,
+            "duplicates_merged": 0,
+        })
+        _RECENT_FOUND.clear()
+
+
+def record_discovered(kind: str, title: str, episodes: int = 0) -> None:
+    """Record a selected catalog title for the dashboard without logging credentials."""
+    with _STATUS_LOCK:
+        if kind == "movie":
+            _RUNTIME_METRICS["source_movies"] = _RUNTIME_METRICS.get("source_movies", 0) + 1
+        else:
+            _RUNTIME_METRICS["source_shows"] = _RUNTIME_METRICS.get("source_shows", 0) + 1
+            _RUNTIME_METRICS["source_episodes"] = _RUNTIME_METRICS.get("source_episodes", 0) + max(0, episodes)
+        _RECENT_FOUND.appendleft({"kind": kind, "title": safe_name(title, "Unknown", 120)})
+
+
+def set_library_discovery(movies: int, shows: int, episodes: int, duplicates: int) -> None:
+    """Publish final post-merge counts for the library currently being built."""
+    with _STATUS_LOCK:
+        _RUNTIME_METRICS.update({
+            "library_movies": max(0, movies),
+            "library_shows": max(0, shows),
+            "library_episodes": max(0, episodes),
+            "duplicates_merged": max(0, duplicates),
+        })
 
 
 def write_runtime_status(
@@ -149,18 +189,20 @@ def write_runtime_status(
     target = os.getenv("XTREAM_STATUS_FILE", "").strip()
     if not target:
         return
-    payload = {
-        "state": state,
-        "stage": stage,
-        "current": max(0, int(current)),
-        "total": max(0, int(total)),
-        "detail": str(detail or "")[:160],
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
     path = Path(target)
     temporary = path.with_name(path.name + ".tmp")
     try:
         with _STATUS_LOCK:
+            payload = {
+                "state": state,
+                "stage": stage,
+                "current": max(0, int(current)),
+                "total": max(0, int(total)),
+                "detail": str(detail or "")[:160],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "metrics": dict(_RUNTIME_METRICS),
+                "recent_found": list(_RECENT_FOUND),
+            }
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(temporary, path)
@@ -1215,6 +1257,7 @@ def collect_movies(
             "",
             (fallback_identity,) if fallback_identity != identity else (),
         ))
+        record_discovered("movie", display)
         if batch:
             batch.new_movies.add(batch_id)
             if len(batch.new_movies) >= config["batch_size"]:
@@ -1311,6 +1354,7 @@ def collect_series(
         progress.update(position, show_name)
         LOG.debug("Read series %d/%d: %s", position, total, show_name)
         entries.extend(show_entries)
+        record_discovered("show", show_name, len(show_entries))
         if batch:
             batch.new_series.add(series_id)
         if config["sample_size"] and len(entries) >= config["sample_size"]:
@@ -1618,6 +1662,7 @@ def run(argv: list[str] | None = None) -> int:
         if args.setup:
             interactive_setup(args.config or Path("config.json"))
             return 0
+        reset_runtime_discovery()
         config = load_config(args.config, args)
         write_runtime_status("running", "Starting sync", 0, 0, "Loading configuration", force=True)
         if args.reset_batch and not config["batch_size"]:
@@ -1650,6 +1695,15 @@ def run(argv: list[str] | None = None) -> int:
             checkpoint_enabled = not batch and not config["sample_size"] and not args.dry_run
             saved_entries = load_pending_entries(config) if checkpoint_enabled else None
             entries: list[Entry] = saved_entries if saved_entries is not None else []
+            if saved_entries is not None:
+                saved_movie_count = sum(entry.identity.startswith("movie:") for entry in entries)
+                saved_episode_count = sum(entry.identity.startswith("series:") for entry in entries)
+                saved_show_count = len({entry.collection_identity for entry in entries if entry.collection_identity})
+                set_library_discovery(saved_movie_count, saved_show_count, saved_episode_count, 0)
+                write_runtime_status(
+                    "running", "Resuming saved library", len(entries), len(entries),
+                    f"{saved_movie_count} movies and {saved_show_count} TV shows", force=True,
+                )
             if saved_entries is None:
                 provider_results: list[tuple[str, list[Entry]]] = []
                 for provider_index, (provider_name, current_config, client) in enumerate(provider_clients):
@@ -1671,6 +1725,8 @@ def run(argv: list[str] | None = None) -> int:
                     entries = movies + episodes
                 movie_count = sum(entry.identity.startswith("movie:") for entry in entries)
                 episode_count = sum(entry.identity.startswith("series:") for entry in entries)
+                show_count = len({entry.collection_identity for entry in entries if entry.collection_identity})
+                set_library_discovery(movie_count, show_count, episode_count, duplicate_count)
                 if config["sync_movies"] and not movie_count and not config["allow_empty_library"] and not batch:
                     raise SyncError("combined movie catalog is empty; refusing to replace the existing library")
                 if config["sync_series"] and not episode_count and not config["allow_empty_library"] and not batch:
