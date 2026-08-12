@@ -85,8 +85,10 @@ if ! id xtream-strm >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 "$INSTALL_DIR"
+install -d -m 0755 /usr/local/bin
 install -d -o root -g media -m 0750 "$CONFIG_DIR"
 install -m 0755 "$SCRIPT_DIR/xtream_strm.py" "$INSTALL_DIR/xtream_strm.py"
+install -m 0755 "$SCRIPT_DIR/xtream-strm-menu" /usr/local/bin/xtream-strm
 
 EXISTING_CONFIG=no
 RECONFIGURE=yes
@@ -166,7 +168,7 @@ if [ "$EXISTING_CONFIG" = yes ]; then
   echo ""
   echo "Xtream STRM was updated successfully. Your existing library was not restarted or re-imported."
   echo "Run a sync whenever you are ready:"
-  echo "  sudo systemctl start xtream-strm.service"
+  echo "  sudo xtream-strm"
   exit 0
 fi
 
@@ -221,7 +223,7 @@ case "$import_choice" in
     fi
     echo ""
     echo "The first batch is ready. Let Jellyfin scan it, then repeat:"
-    echo "  sudo -u xtream-strm $INSTALL_DIR/xtream_strm.py --config $CONFIG_FILE --batch 100"
+    echo "  sudo xtream-strm"
     echo "If Jellyfin is configured later, add --continuous to run every remaining batch automatically."
     echo "When batching is complete, enable regular six-hour refreshes:"
     echo "  sudo systemctl enable --now xtream-strm.timer"
@@ -239,6 +241,7 @@ echo "Starting the complete library sync now..."
 if systemctl start xtream-strm.service; then
   echo "Sync finished successfully. The library will refresh every six hours."
   echo "Library: $OUTPUT_DIR"
+  echo "Open the control menu any time with: sudo xtream-strm"
 else
   echo "The service was installed, but the first sync failed." >&2
   echo "View the reason with: sudo journalctl -u xtream-strm.service -n 100" >&2
