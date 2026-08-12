@@ -102,8 +102,8 @@ if [ "$RECONFIGURE" = yes ]; then
   "$INSTALL_DIR/xtream_strm.py" --setup --config "$CONFIG_FILE"
 fi
 
-chown xtream-strm:media "$CONFIG_FILE"
-chmod 0640 "$CONFIG_FILE"
+chown xtream-strm:root "$CONFIG_FILE"
+chmod 0600 "$CONFIG_FILE"
 
 OUTPUT_DIR=$(python3 -c 'import json, os, sys; print(os.path.abspath(os.path.expanduser(json.load(open(sys.argv[1], encoding="utf-8"))["output_dir"])))' "$CONFIG_FILE")
 case "$OUTPUT_DIR" in
@@ -167,6 +167,26 @@ case "$import_choice" in
     ;;
   2) ;;
   1|"")
+    JELLYFIN_READY=$(python3 -c 'import json, sys; c=json.load(open(sys.argv[1], encoding="utf-8")); print("yes" if c.get("jellyfin_url") and c.get("jellyfin_api_key") else "no")' "$CONFIG_FILE")
+    if [ "$JELLYFIN_READY" = yes ]; then
+      printf "Run every batch automatically and wait for Jellyfin scans? [Y/n]: "
+      read -r automatic_answer
+      case "$automatic_answer" in
+        n|N|no|NO) ;;
+        *)
+          echo "Starting continuous gradual import. You can safely interrupt and resume this command."
+          if command -v runuser >/dev/null 2>&1; then
+            runuser -u xtream-strm -- "$INSTALL_DIR/xtream_strm.py" --config "$CONFIG_FILE" --batch 100 --continuous
+          else
+            su -s /bin/sh xtream-strm -c "'$INSTALL_DIR/xtream_strm.py' --config '$CONFIG_FILE' --batch 100 --continuous"
+          fi
+          systemctl enable --now xtream-strm.timer
+          echo "Initial import complete. Regular six-hour refreshes are enabled."
+          echo "Library: $OUTPUT_DIR"
+          exit 0
+          ;;
+      esac
+    fi
     echo "Starting the first gradual batch (up to 100 movies and 100 shows)..."
     if command -v runuser >/dev/null 2>&1; then
       runuser -u xtream-strm -- "$INSTALL_DIR/xtream_strm.py" --config "$CONFIG_FILE" --batch 100
@@ -176,6 +196,7 @@ case "$import_choice" in
     echo ""
     echo "The first batch is ready. Let Jellyfin scan it, then repeat:"
     echo "  sudo -u xtream-strm $INSTALL_DIR/xtream_strm.py --config $CONFIG_FILE --batch 100"
+    echo "If Jellyfin is configured later, add --continuous to run every remaining batch automatically."
     echo "When batching is complete, enable regular six-hour refreshes:"
     echo "  sudo systemctl enable --now xtream-strm.timer"
     echo "  sudo systemctl start xtream-strm.service"
