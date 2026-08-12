@@ -105,7 +105,9 @@ sudo journalctl -u xtream-strm.service -n 100
 sudo /opt/xtream-strm/xtream_strm.py --setup --config /etc/xtream-strm/config.json
 ```
 
-When a configuration already exists, setup presents a menu. You can change only the provider login, library directory, content/groups, Jellyfin connection, or sync behavior; select multiple sections with an entry such as `2,3`. Settings outside those sections are preserved. If the provider account changes, setup also refreshes its group selection because group IDs are provider-specific.
+When a configuration already exists, setup presents a menu. You can change only the provider login, library and media folders, content/groups, Jellyfin connection, or sync behavior; select multiple sections with an entry such as `2,3`. Settings outside those sections are preserved. If the provider account changes, setup also refreshes its group selection because group IDs are provider-specific.
+
+The library section separately asks for the movie and TV folders. They can be simple names such as `Movies` and `TV Shows`, or nested locations such as `Video/Films` and `Television/Shows`. Both stay beneath the main library directory for safe service permissions and manifest cleanup. They must be separate and cannot be nested inside one another.
 
 Rerunning the internet installer offers the same menu. Updating an existing installation no longer forces another sample or restarts the full import.
 
@@ -168,6 +170,7 @@ Command-line connection settings override environment variables, which override 
 - `include_categories`: exact, case-insensitive category names to include; empty means all.
 - `exclude_categories`: exact, case-insensitive names to skip.
 - `movie_category_ids` and `series_category_ids`: provider group IDs selected by guided setup. Empty means every group of that media type.
+- `movies_directory` and `series_directory`: separate movie and TV folder paths beneath `output_dir`. Nested relative paths are supported.
 - `normalize_names`: produce consistent media-server names by cleaning Unicode, HTML entities, whitespace, quality tags, release years, episode numbers, and season numbers.
 - `add_provider_ids`: append a Jellyfin-compatible TMDB or IMDb ID when that ID is already supplied by the Xtream provider. The exporter does not scrape metadata sites or make extra per-movie metadata requests.
 - `auto_strip_name_tags`: remove short uppercase provider tags before a separator, such as `PS -`, `SOM -`, `VIP:`, or `[ABC]`.
