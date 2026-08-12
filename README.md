@@ -46,6 +46,8 @@ The exporter uses multiple worker threads to load TV-show details and create STR
 
 For complete syncs, the exporter saves a private write checkpoint after all provider catalogs and TV-show details have been read. If writing is interrupted, running the same sync again resumes from that checkpoint and does not reread every show. The checkpoint is removed automatically only after all STRM files and the manifest are written successfully. Changing the provider, selected groups, media folders, or naming behavior intentionally invalidates the old checkpoint. Batch mode continues to use its existing per-show progress file instead.
 
+If an older managed STRM file on NFS is visible but not readable, the exporter attempts to atomically replace that exact file with the newly generated stream URL instead of abandoning the full sync. This works when the service can write to the containing directory. A directory-level NFS permission failure still stops safely with a focused ownership error.
+
 ## Test with a small batch first
 
 Preview five movies and five episodes without writing anything:
