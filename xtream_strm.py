@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 LOG = logging.getLogger("xtream-strm")
 MANIFEST_NAME = ".xtream-strm-manifest.json"
 BATCH_STATE_NAME = ".xtream-strm-batch.json"
