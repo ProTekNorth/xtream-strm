@@ -28,6 +28,7 @@
   "jellyfin_verify_tls": true,
   "request_timeout": 30,
   "retries": 3,
+  "workers": 8,
   "verify_tls": true,
   "file_mode": "0640",
   "directory_mode": "0750"
