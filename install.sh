@@ -130,10 +130,26 @@ if [ -L "$OUTPUT_DIR" ]; then
 fi
 
 if [ -d "$OUTPUT_DIR" ]; then
-  chgrp media "$OUTPUT_DIR"
-  chmod g+rwx "$OUTPUT_DIR"
+  if ! chgrp media "$OUTPUT_DIR" 2>/dev/null; then
+    echo "Note: this mounted library does not allow group changes; checking actual write access instead."
+  fi
+  if ! chmod g+rwx "$OUTPUT_DIR" 2>/dev/null; then
+    echo "Note: this mounted library does not allow permission changes; checking actual write access instead."
+  fi
 else
   install -d -o xtream-strm -g media -m 0770 "$OUTPUT_DIR"
+fi
+
+if command -v runuser >/dev/null 2>&1; then
+  if ! runuser -u xtream-strm -- python3 -c 'import os, sys, tempfile; fd, path = tempfile.mkstemp(prefix=".xtream-strm-write-test.", dir=sys.argv[1]); os.close(fd); os.unlink(path)' "$OUTPUT_DIR"; then
+    echo "The xtream-strm service account cannot write to: $OUTPUT_DIR" >&2
+    echo "Adjust the mount ownership or permissions, then run this installer again." >&2
+    exit 1
+  fi
+elif ! su -s /bin/sh xtream-strm -c "test -w '$OUTPUT_DIR'"; then
+  echo "The xtream-strm service account cannot write to: $OUTPUT_DIR" >&2
+  echo "Adjust the mount ownership or permissions, then run this installer again." >&2
+  exit 1
 fi
 install -m 0644 "$SCRIPT_DIR/xtream-strm.service" /etc/systemd/system/xtream-strm.service
 install -m 0644 "$SCRIPT_DIR/xtream-strm.timer" /etc/systemd/system/xtream-strm.timer
